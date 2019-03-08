@@ -6,9 +6,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/hashicorp/vault/helper/logformat"
+	log "github.com/hashicorp/go-hclog"
+	"github.com/hashicorp/vault/helper/logging"
 	"github.com/hashicorp/vault/physical"
-	log "github.com/mgutz/logxi/v1"
 
 	"github.com/samuel/go-zookeeper/zk"
 )
@@ -44,7 +44,7 @@ func TestZooKeeperBackend(t *testing.T) {
 		client.Close()
 	}()
 
-	logger := logformat.NewVaultLogger(log.LevelTrace)
+	logger := logging.NewVaultLogger(log.Debug)
 
 	b, err := NewZooKeeperBackend(map[string]string{
 		"address": addr + "," + addr,
@@ -84,19 +84,21 @@ func TestZooKeeperHABackend(t *testing.T) {
 		client.Close()
 	}()
 
-	logger := logformat.NewVaultLogger(log.LevelTrace)
-
-	b, err := NewZooKeeperBackend(map[string]string{
+	logger := logging.NewVaultLogger(log.Debug)
+	config := map[string]string{
 		"address": addr + "," + addr,
 		"path":    randPath,
-	}, logger)
+	}
+
+	b, err := NewZooKeeperBackend(config, logger)
 	if err != nil {
 		t.Fatalf("err: %s", err)
 	}
 
-	ha, ok := b.(physical.HABackend)
-	if !ok {
-		t.Fatalf("zookeeper does not implement HABackend")
+	b2, err := NewZooKeeperBackend(config, logger)
+	if err != nil {
+		t.Fatalf("err: %s", err)
 	}
-	physical.ExerciseHABackend(t, ha, ha)
+
+	physical.ExerciseHABackend(t, b.(physical.HABackend), b2.(physical.HABackend))
 }

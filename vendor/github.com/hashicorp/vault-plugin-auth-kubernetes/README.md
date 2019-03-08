@@ -1,13 +1,13 @@
-# Vault Plugin: Kubernetes Auth Backend
+# Vault Plugin: Kubernetes Auth Backend [![Build Status](https://travis-ci.org/hashicorp/vault-plugin-auth-kubernetes.svg?branch=master)](https://travis-ci.org/hashicorp/vault-plugin-auth-kubernetes)
 
 This is a standalone backend plugin for use with [Hashicorp Vault](https://www.github.com/hashicorp/vault).
-This plugin allows for Kubernets Service Accounts to authenticate with Vault.
+This plugin allows for Kubernetes Service Accounts to authenticate with Vault.
 
 **Please note**: We take Vault's security and our users' trust very seriously. If you believe you have found a security issue in Vault, _please responsibly disclose_ by contacting us at [security@hashicorp.com](mailto:security@hashicorp.com).
 
 ## Quick Links
     - Vault Website: https://www.vaultproject.io
-    - Kunernetes Auth Docs: https://www.vaultproject.io/docs/auth/kubernetes.html
+    - Kubernetes Auth Docs: https://www.vaultproject.io/docs/auth/kubernetes.html
     - Main Project Github: https://www.github.com/hashicorp/vault
 
 

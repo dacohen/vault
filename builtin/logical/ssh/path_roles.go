@@ -1,11 +1,13 @@
 package ssh
 
 import (
+	"context"
 	"fmt"
 	"strings"
 
 	"time"
 
+	"github.com/hashicorp/errwrap"
 	"github.com/hashicorp/vault/helper/cidrutil"
 	"github.com/hashicorp/vault/helper/parseutil"
 	"github.com/hashicorp/vault/logical"
@@ -13,9 +15,12 @@ import (
 )
 
 const (
-	KeyTypeOTP     = "otp"
+	// KeyTypeOTP is an key of type OTP
+	KeyTypeOTP = "otp"
+	// KeyTypeDynamic is dynamic key type
 	KeyTypeDynamic = "dynamic"
-	KeyTypeCA      = "ca"
+	// KeyTypeCA is an key of type CA
+	KeyTypeCA = "ca"
 )
 
 // Structure that represents a role in SSH backend. This is a common role structure
@@ -46,6 +51,7 @@ type sshRole struct {
 	AllowSubdomains        bool              `mapstructure:"allow_subdomains" json:"allow_subdomains"`
 	AllowUserKeyIDs        bool              `mapstructure:"allow_user_key_ids" json:"allow_user_key_ids"`
 	KeyIDFormat            string            `mapstructure:"key_id_format" json:"key_id_format"`
+	AllowedUserKeyLengths  map[string]int    `mapstructure:"allowed_user_key_lengths" json:"allowed_user_key_lengths"`
 }
 
 func pathListRoles(b *backend) *framework.Path {
@@ -83,10 +89,11 @@ func pathRoles(b *backend) *framework.Path {
 				Description: `
 				[Required for Dynamic type] [Not applicable for OTP type] [Not applicable for CA type]
 				Admin user at remote host. The shared key being registered should be
-				for this user and should have root privileges. Everytime a dynamic 
+				for this user and should have root privileges. Everytime a dynamic
 				credential is being generated for other users, Vault uses this admin
 				username to login to remote host and install the generated credential
 				for the other user.`,
+				DisplayName: "Admin Username",
 			},
 			"default_user": &framework.FieldSchema{
 				Type: framework.TypeString,
@@ -95,6 +102,7 @@ func pathRoles(b *backend) *framework.Path {
 				Default username for which a credential will be generated.
 				When the endpoint 'creds/' is used without a username, this
 				value will be used as default username.`,
+				DisplayName: "Default Username",
 			},
 			"cidr_list": &framework.FieldSchema{
 				Type: framework.TypeString,
@@ -102,6 +110,7 @@ func pathRoles(b *backend) *framework.Path {
 				[Optional for Dynamic type] [Optional for OTP type] [Not applicable for CA type]
 				Comma separated list of CIDR blocks for which the role is applicable for.
 				CIDR blocks can belong to more than one role.`,
+				DisplayName: "CIDR List",
 			},
 			"exclude_cidr_list": &framework.FieldSchema{
 				Type: framework.TypeString,
@@ -110,6 +119,7 @@ func pathRoles(b *backend) *framework.Path {
 				Comma separated list of CIDR blocks. IP addresses belonging to these blocks are not
 				accepted by the role. This is particularly useful when big CIDR blocks are being used
 				by the role and certain parts of it needs to be kept out.`,
+				DisplayName: "Exclude CIDR List",
 			},
 			"port": &framework.FieldSchema{
 				Type: framework.TypeInt,
@@ -119,6 +129,7 @@ func pathRoles(b *backend) *framework.Path {
 				play any role in creation of OTP. For 'otp' type, this is just a way
 				to inform client about the port number to use. Port number will be
 				returned to client by Vault server along with OTP.`,
+				DisplayValue: 22,
 			},
 			"key_type": &framework.FieldSchema{
 				Type: framework.TypeString,
@@ -126,6 +137,8 @@ func pathRoles(b *backend) *framework.Path {
 				[Required for all types]
 				Type of key used to login to hosts. It can be either 'otp', 'dynamic' or 'ca'.
 				'otp' type requires agent to be installed in remote hosts.`,
+				AllowedValues: []interface{}{"otp", "dynamic", "ca"},
+				DisplayValue:  "ca",
 			},
 			"key_bits": &framework.FieldSchema{
 				Type: framework.TypeInt,
@@ -175,20 +188,22 @@ func pathRoles(b *backend) *framework.Path {
 				`,
 			},
 			"ttl": &framework.FieldSchema{
-				Type: framework.TypeString,
+				Type: framework.TypeDurationSecond,
 				Description: `
 				[Not applicable for Dynamic type] [Not applicable for OTP type] [Optional for CA type]
 				The lease duration if no specific lease duration is
 				requested. The lease duration controls the expiration
 				of certificates issued by this backend. Defaults to
 				the value of max_ttl.`,
+				DisplayName: "TTL",
 			},
 			"max_ttl": &framework.FieldSchema{
-				Type: framework.TypeString,
+				Type: framework.TypeDurationSecond,
 				Description: `
 				[Not applicable for Dynamic type] [Not applicable for OTP type] [Optional for CA type]
 				The maximum allowed lease duration
 				`,
+				DisplayName: "Max TTL",
 			},
 			"allowed_critical_options": &framework.FieldSchema{
 				Type: framework.TypeString,
@@ -196,7 +211,7 @@ func pathRoles(b *backend) *framework.Path {
 				[Not applicable for Dynamic type] [Not applicable for OTP type] [Optional for CA type]
 				A comma-separated list of critical options that certificates can have when signed.
  				To allow any critical options, set this to an empty string.
- 				`,
+				 `,
 			},
 			"allowed_extensions": &framework.FieldSchema{
 				Type: framework.TypeString,
@@ -266,16 +281,25 @@ func pathRoles(b *backend) *framework.Path {
 				When false, the key ID will always be the token display name.
 				The key ID is logged by the SSH server and can be useful for auditing.
 				`,
+				DisplayName: "Allow User Key IDs",
 			},
 			"key_id_format": &framework.FieldSchema{
 				Type: framework.TypeString,
 				Description: `
 				[Not applicable for Dynamic type] [Not applicable for OTP type] [Optional for CA type]
 				When supplied, this value specifies a custom format for the key id of a signed certificate.
-				The following variables are availble for use: '{{token_display_name}}' - The display name of
+				The following variables are available for use: '{{token_display_name}}' - The display name of
 				the token used to make the request. '{{role_name}}' - The name of the role signing the request.
 				'{{public_key_hash}}' - A SHA256 checksum of the public key that is being signed.
 				`,
+				DisplayName: "Key ID Format",
+			},
+			"allowed_user_key_lengths": &framework.FieldSchema{
+				Type: framework.TypeMap,
+				Description: `
+                                [Not applicable for Dynamic type] [Not applicable for OTP type] [Optional for CA type]
+                                If set, allows the enforcement of key types and minimum key sizes to be signed.
+                                `,
 			},
 		},
 
@@ -290,7 +314,7 @@ func pathRoles(b *backend) *framework.Path {
 	}
 }
 
-func (b *backend) pathRoleWrite(req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
+func (b *backend) pathRoleWrite(ctx context.Context, req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
 	roleName := d.Get("role").(string)
 	if roleName == "" {
 		return logical.ErrorResponse("missing role name"), nil
@@ -304,7 +328,7 @@ func (b *backend) pathRoleWrite(req *logical.Request, d *framework.FieldData) (*
 	if cidrList != "" {
 		valid, err := cidrutil.ValidateCIDRListString(cidrList, ",")
 		if err != nil {
-			return nil, fmt.Errorf("failed to validate cidr_list: %v", err)
+			return nil, errwrap.Wrapf("failed to validate cidr_list: {{err}}", err)
 		}
 		if !valid {
 			return logical.ErrorResponse("failed to validate cidr_list"), nil
@@ -316,7 +340,7 @@ func (b *backend) pathRoleWrite(req *logical.Request, d *framework.FieldData) (*
 	if excludeCidrList != "" {
 		valid, err := cidrutil.ValidateCIDRListString(excludeCidrList, ",")
 		if err != nil {
-			return nil, fmt.Errorf("failed to validate exclude_cidr_list entry: %v", err)
+			return nil, errwrap.Wrapf("failed to validate exclude_cidr_list entry: {{err}}", err)
 		}
 		if !valid {
 			return logical.ErrorResponse(fmt.Sprintf("failed to validate exclude_cidr_list entry: %v", err)), nil
@@ -367,7 +391,7 @@ func (b *backend) pathRoleWrite(req *logical.Request, d *framework.FieldData) (*
 		if keyName == "" {
 			return logical.ErrorResponse("missing key name"), nil
 		}
-		keyEntry, err := req.Storage.Get(fmt.Sprintf("keys/%s", keyName))
+		keyEntry, err := req.Storage.Get(ctx, fmt.Sprintf("keys/%s", keyName))
 		if err != nil || keyEntry == nil {
 			return logical.ErrorResponse(fmt.Sprintf("invalid 'key': %q", keyName)), nil
 		}
@@ -386,15 +410,15 @@ func (b *backend) pathRoleWrite(req *logical.Request, d *framework.FieldData) (*
 			return logical.ErrorResponse("missing admin username"), nil
 		}
 
-		// This defaults to 1024 and it can also be 2048.
+		// This defaults to 1024 and it can also be 2048 and 4096.
 		keyBits := d.Get("key_bits").(int)
-		if keyBits != 0 && keyBits != 1024 && keyBits != 2048 {
+		if keyBits != 0 && keyBits != 1024 && keyBits != 2048 && keyBits != 4096 {
 			return logical.ErrorResponse("invalid key_bits field"), nil
 		}
 
-		// If user has not set this field, default it to 1024
+		// If user has not set this field, default it to 2048
 		if keyBits == 0 {
-			keyBits = 1024
+			keyBits = 2048
 		}
 
 		// Store all the fields required by dynamic key type
@@ -426,16 +450,16 @@ func (b *backend) pathRoleWrite(req *logical.Request, d *framework.FieldData) (*
 		return nil, err
 	}
 
-	if err := req.Storage.Put(entry); err != nil {
+	if err := req.Storage.Put(ctx, entry); err != nil {
 		return nil, err
 	}
 	return nil, nil
 }
 
 func (b *backend) createCARole(allowedUsers, defaultUser string, data *framework.FieldData) (*sshRole, *logical.Response) {
+	ttl := time.Duration(data.Get("ttl").(int)) * time.Second
+	maxTTL := time.Duration(data.Get("max_ttl").(int)) * time.Second
 	role := &sshRole{
-		MaxTTL: data.Get("max_ttl").(string),
-		TTL:    data.Get("ttl").(string),
 		AllowedCriticalOptions: data.Get("allowed_critical_options").(string),
 		AllowedExtensions:      data.Get("allowed_extensions").(string),
 		AllowUserCertificates:  data.Get("allow_user_certificates").(bool),
@@ -456,55 +480,28 @@ func (b *backend) createCARole(allowedUsers, defaultUser string, data *framework
 
 	defaultCriticalOptions := convertMapToStringValue(data.Get("default_critical_options").(map[string]interface{}))
 	defaultExtensions := convertMapToStringValue(data.Get("default_extensions").(map[string]interface{}))
-
-	var maxTTL time.Duration
-	maxSystemTTL := b.System().MaxLeaseTTL()
-	if len(role.MaxTTL) == 0 {
-		maxTTL = maxSystemTTL
-	} else {
-		var err error
-		maxTTL, err = parseutil.ParseDurationSecond(role.MaxTTL)
-		if err != nil {
-			return nil, logical.ErrorResponse(fmt.Sprintf(
-				"Invalid max ttl: %s", err))
-		}
-	}
-	if maxTTL > maxSystemTTL {
-		return nil, logical.ErrorResponse("Requested max TTL is higher than backend maximum")
+	allowedUserKeyLengths, err := convertMapToIntValue(data.Get("allowed_user_key_lengths").(map[string]interface{}))
+	if err != nil {
+		return nil, logical.ErrorResponse(fmt.Sprintf("error processing allowed_user_key_lengths: %s", err.Error()))
 	}
 
-	ttl := b.System().DefaultLeaseTTL()
-	if len(role.TTL) != 0 {
-		var err error
-		ttl, err = parseutil.ParseDurationSecond(role.TTL)
-		if err != nil {
-			return nil, logical.ErrorResponse(fmt.Sprintf(
-				"Invalid ttl: %s", err))
-		}
-	}
-	if ttl > maxTTL {
-		// If they are using the system default, cap it to the role max;
-		// if it was specified on the command line, make it an error
-		if len(role.TTL) == 0 {
-			ttl = maxTTL
-		} else {
-			return nil, logical.ErrorResponse(
-				`"ttl" value must be less than "max_ttl" and/or backend default max lease TTL value`,
-			)
-		}
+	if ttl != 0 && maxTTL != 0 && ttl > maxTTL {
+		return nil, logical.ErrorResponse(
+			`"ttl" value must be less than "max_ttl" when both are specified`)
 	}
 
-	// Persist clamped TTLs
+	// Persist TTLs
 	role.TTL = ttl.String()
 	role.MaxTTL = maxTTL.String()
 	role.DefaultCriticalOptions = defaultCriticalOptions
 	role.DefaultExtensions = defaultExtensions
+	role.AllowedUserKeyLengths = allowedUserKeyLengths
 
 	return role, nil
 }
 
-func (b *backend) getRole(s logical.Storage, n string) (*sshRole, error) {
-	entry, err := s.Get("roles/" + n)
+func (b *backend) getRole(ctx context.Context, s logical.Storage, n string) (*sshRole, error) {
+	entry, err := s.Get(ctx, "roles/"+n)
 	if err != nil {
 		return nil, err
 	}
@@ -520,17 +517,121 @@ func (b *backend) getRole(s logical.Storage, n string) (*sshRole, error) {
 	return &result, nil
 }
 
-func (b *backend) pathRoleList(req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
-	entries, err := req.Storage.List("roles/")
+// parseRole converts a sshRole object into its map[string]interface representation,
+// with appropriate values for each KeyType. If the KeyType is invalid, it will return
+// an error.
+func (b *backend) parseRole(role *sshRole) (map[string]interface{}, error) {
+	var result map[string]interface{}
+
+	switch role.KeyType {
+	case KeyTypeOTP:
+		result = map[string]interface{}{
+			"default_user":      role.DefaultUser,
+			"cidr_list":         role.CIDRList,
+			"exclude_cidr_list": role.ExcludeCIDRList,
+			"key_type":          role.KeyType,
+			"port":              role.Port,
+			"allowed_users":     role.AllowedUsers,
+		}
+	case KeyTypeCA:
+		ttl, err := parseutil.ParseDurationSecond(role.TTL)
+		if err != nil {
+			return nil, err
+		}
+		maxTTL, err := parseutil.ParseDurationSecond(role.MaxTTL)
+		if err != nil {
+			return nil, err
+		}
+
+		result = map[string]interface{}{
+			"allowed_users":            role.AllowedUsers,
+			"allowed_domains":          role.AllowedDomains,
+			"default_user":             role.DefaultUser,
+			"ttl":                      int64(ttl.Seconds()),
+			"max_ttl":                  int64(maxTTL.Seconds()),
+			"allowed_critical_options": role.AllowedCriticalOptions,
+			"allowed_extensions":       role.AllowedExtensions,
+			"allow_user_certificates":  role.AllowUserCertificates,
+			"allow_host_certificates":  role.AllowHostCertificates,
+			"allow_bare_domains":       role.AllowBareDomains,
+			"allow_subdomains":         role.AllowSubdomains,
+			"allow_user_key_ids":       role.AllowUserKeyIDs,
+			"key_id_format":            role.KeyIDFormat,
+			"key_type":                 role.KeyType,
+			"key_bits":                 role.KeyBits,
+			"default_critical_options": role.DefaultCriticalOptions,
+			"default_extensions":       role.DefaultExtensions,
+			"allowed_user_key_lengths": role.AllowedUserKeyLengths,
+		}
+	case KeyTypeDynamic:
+		result = map[string]interface{}{
+			"key":               role.KeyName,
+			"admin_user":        role.AdminUser,
+			"default_user":      role.DefaultUser,
+			"cidr_list":         role.CIDRList,
+			"exclude_cidr_list": role.ExcludeCIDRList,
+			"port":              role.Port,
+			"key_type":          role.KeyType,
+			"key_bits":          role.KeyBits,
+			"allowed_users":     role.AllowedUsers,
+			"key_option_specs":  role.KeyOptionSpecs,
+			// Returning install script will make the output look messy.
+			// But this is one way for clients to see the script that is
+			// being used to install the key. If there is some problem,
+			// the script can be modified and configured by clients.
+			"install_script": role.InstallScript,
+		}
+	default:
+		return nil, fmt.Errorf("invalid key type: %v", role.KeyType)
+	}
+
+	return result, nil
+}
+
+func (b *backend) pathRoleList(ctx context.Context, req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
+	entries, err := req.Storage.List(ctx, "roles/")
 	if err != nil {
 		return nil, err
 	}
 
-	return logical.ListResponse(entries), nil
+	keyInfo := map[string]interface{}{}
+	for _, entry := range entries {
+		role, err := b.getRole(ctx, req.Storage, entry)
+		if err != nil {
+			// On error, log warning and continue
+			if b.Logger().IsWarn() {
+				b.Logger().Warn("error getting role info", "role", entry, "error", err)
+			}
+			continue
+		}
+		if role == nil {
+			// On empty role, log warning and continue
+			if b.Logger().IsWarn() {
+				b.Logger().Warn("no role info found", "role", entry)
+			}
+			continue
+		}
+
+		roleInfo, err := b.parseRole(role)
+		if err != nil {
+			if b.Logger().IsWarn() {
+				b.Logger().Warn("error parsing role info", "role", entry, "error", err)
+			}
+			continue
+		}
+
+		if keyType, ok := roleInfo["key_type"]; ok {
+			keyInfo[entry] = map[string]interface{}{
+				"key_type": keyType,
+			}
+		}
+	}
+
+	return logical.ListResponseWithInfo(entries, keyInfo), nil
 }
 
-func (b *backend) pathRoleRead(req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
-	role, err := b.getRole(req.Storage, d.Get("role").(string))
+func (b *backend) pathRoleRead(ctx context.Context, req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
+	role, err := b.getRole(ctx, req.Storage, d.Get("role").(string))
 	if err != nil {
 		return nil, err
 	}
@@ -538,74 +639,28 @@ func (b *backend) pathRoleRead(req *logical.Request, d *framework.FieldData) (*l
 		return nil, nil
 	}
 
-	// Return information should be based on the key type of the role
-	if role.KeyType == KeyTypeOTP {
-		return &logical.Response{
-			Data: map[string]interface{}{
-				"default_user":      role.DefaultUser,
-				"cidr_list":         role.CIDRList,
-				"exclude_cidr_list": role.ExcludeCIDRList,
-				"key_type":          role.KeyType,
-				"port":              role.Port,
-				"allowed_users":     role.AllowedUsers,
-			},
-		}, nil
-	} else if role.KeyType == KeyTypeCA {
-		return &logical.Response{
-			Data: map[string]interface{}{
-				"allowed_users":   role.AllowedUsers,
-				"allowed_domains": role.AllowedDomains,
-				"default_user":    role.DefaultUser,
-				"max_ttl":         role.MaxTTL,
-				"ttl":             role.TTL,
-				"allowed_critical_options": role.AllowedCriticalOptions,
-				"allowed_extensions":       role.AllowedExtensions,
-				"allow_user_certificates":  role.AllowUserCertificates,
-				"allow_host_certificates":  role.AllowHostCertificates,
-				"allow_bare_domains":       role.AllowBareDomains,
-				"allow_subdomains":         role.AllowSubdomains,
-				"allow_user_key_ids":       role.AllowUserKeyIDs,
-				"key_id_format":            role.KeyIDFormat,
-				"key_type":                 role.KeyType,
-				"default_critical_options": role.DefaultCriticalOptions,
-				"default_extensions":       role.DefaultExtensions,
-			},
-		}, nil
-	} else {
-		return &logical.Response{
-			Data: map[string]interface{}{
-				"key":               role.KeyName,
-				"admin_user":        role.AdminUser,
-				"default_user":      role.DefaultUser,
-				"cidr_list":         role.CIDRList,
-				"exclude_cidr_list": role.ExcludeCIDRList,
-				"port":              role.Port,
-				"key_type":          role.KeyType,
-				"key_bits":          role.KeyBits,
-				"allowed_users":     role.AllowedUsers,
-				"key_option_specs":  role.KeyOptionSpecs,
-				// Returning install script will make the output look messy.
-				// But this is one way for clients to see the script that is
-				// being used to install the key. If there is some problem,
-				// the script can be modified and configured by clients.
-				"install_script": role.InstallScript,
-			},
-		}, nil
+	roleInfo, err := b.parseRole(role)
+	if err != nil {
+		return nil, err
 	}
+
+	return &logical.Response{
+		Data: roleInfo,
+	}, nil
 }
 
-func (b *backend) pathRoleDelete(req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
+func (b *backend) pathRoleDelete(ctx context.Context, req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
 	roleName := d.Get("role").(string)
 
 	// If the role was given privilege to accept any IP address, there will
 	// be an entry for this role in zero-address roles list. Before the role
 	// is removed, the entry in the list has to be removed.
-	err := b.removeZeroAddressRole(req.Storage, roleName)
+	err := b.removeZeroAddressRole(ctx, req.Storage, roleName)
 	if err != nil {
 		return nil, err
 	}
 
-	err = req.Storage.Delete(fmt.Sprintf("roles/%s", roleName))
+	err = req.Storage.Delete(ctx, fmt.Sprintf("roles/%s", roleName))
 	if err != nil {
 		return nil, err
 	}

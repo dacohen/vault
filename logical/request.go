@@ -1,14 +1,13 @@
 package logical
 
 import (
-	"errors"
 	"fmt"
 	"strings"
 	"time"
 )
 
 // RequestWrapInfo is a struct that stores information about desired response
-// wrapping behavior
+// and seal wrapping behavior
 type RequestWrapInfo struct {
 	// Setting to non-zero specifies that the response should be wrapped.
 	// Specifies the desired TTL of the wrapping token.
@@ -17,6 +16,10 @@ type RequestWrapInfo struct {
 	// The format to use for the wrapped response; if not specified it's a bare
 	// token
 	Format string `json:"format" structs:"format" mapstructure:"format" sentinel:""`
+
+	// A flag to conforming backends that data for a given request should be
+	// seal wrapped
+	SealWrap bool `json:"seal_wrap" structs:"seal_wrap" mapstructure:"seal_wrap" sentinel:""`
 }
 
 func (r *RequestWrapInfo) SentinelGet(key string) (interface{}, error) {
@@ -33,6 +36,21 @@ func (r *RequestWrapInfo) SentinelGet(key string) (interface{}, error) {
 	return nil, nil
 }
 
+func (r *RequestWrapInfo) SentinelKeys() []string {
+	return []string{
+		"ttl",
+		"ttl_seconds",
+	}
+}
+
+type ClientTokenSource uint32
+
+const (
+	NoClientToken ClientTokenSource = iota
+	ClientTokenFromVaultHeader
+	ClientTokenFromAuthzHeader
+)
+
 // Request is a struct that stores the parameters and context of a request
 // being made to Vault. It is used to abstract the details of the higher level
 // request protocol from the handlers.
@@ -41,6 +59,8 @@ func (r *RequestWrapInfo) SentinelGet(key string) (interface{}, error) {
 // by the router after policy checks; the token namespace would be the right
 // place to access them via Sentinel
 type Request struct {
+	entReq
+
 	// Id is the uuid associated with each request
 	ID string `json:"id" structs:"id" mapstructure:"id" sentinel:""`
 
@@ -117,10 +137,6 @@ type Request struct {
 	// token supplied
 	ClientTokenRemainingUses int `json:"client_token_remaining_uses" structs:"client_token_remaining_uses" mapstructure:"client_token_remaining_uses"`
 
-	// MFACreds holds the parsed MFA information supplied over the API as part of
-	// X-Vault-MFA header
-	MFACreds MFACreds `json:"mfa_creds" structs:"mfa_creds" mapstructure:"mfa_creds" sentinel:""`
-
 	// EntityID is the identity of the caller extracted out of the token used
 	// to make this request
 	EntityID string `json:"entity_id" structs:"entity_id" mapstructure:"entity_id" sentinel:""`
@@ -134,9 +150,25 @@ type Request struct {
 	// accessible.
 	Unauthenticated bool `json:"unauthenticated" structs:"unauthenticated" mapstructure:"unauthenticated"`
 
+	// MFACreds holds the parsed MFA information supplied over the API as part of
+	// X-Vault-MFA header
+	MFACreds MFACreds `json:"mfa_creds" structs:"mfa_creds" mapstructure:"mfa_creds" sentinel:""`
+
+	// Cached token entry. This avoids another lookup in request handling when
+	// we've already looked it up at http handling time. Note that this token
+	// has not been "used", as in it will not properly take into account use
+	// count limitations. As a result this field should only ever be used for
+	// transport to a function that would otherwise do a lookup and then
+	// properly use the token.
+	tokenEntry *TokenEntry
+
 	// For replication, contains the last WAL on the remote side after handling
 	// the request, used for best-effort avoidance of stale read-after-write
-	lastRemoteWAL uint64 `sentinel:""`
+	lastRemoteWAL uint64
+
+	// ClientTokenSource tells us where the client token was sourced from, so
+	// we can delete it before sending off to plugins
+	ClientTokenSource ClientTokenSource
 }
 
 // Get returns a data field and guards for nil Data
@@ -176,6 +208,14 @@ func (r *Request) SentinelGet(key string) (interface{}, error) {
 	return nil, nil
 }
 
+func (r *Request) SentinelKeys() []string {
+	return []string{
+		"path",
+		"wrapping",
+		"wrap_info",
+	}
+}
+
 func (r *Request) LastRemoteWAL() uint64 {
 	return r.lastRemoteWAL
 }
@@ -184,9 +224,16 @@ func (r *Request) SetLastRemoteWAL(last uint64) {
 	r.lastRemoteWAL = last
 }
 
+func (r *Request) TokenEntry() *TokenEntry {
+	return r.tokenEntry
+}
+
+func (r *Request) SetTokenEntry(te *TokenEntry) {
+	r.tokenEntry = te
+}
+
 // RenewRequest creates the structure of the renew request.
-func RenewRequest(
-	path string, secret *Secret, data map[string]interface{}) *Request {
+func RenewRequest(path string, secret *Secret, data map[string]interface{}) *Request {
 	return &Request{
 		Operation: RenewOperation,
 		Path:      path,
@@ -196,8 +243,7 @@ func RenewRequest(
 }
 
 // RenewAuthRequest creates the structure of the renew request for an auth.
-func RenewAuthRequest(
-	path string, auth *Auth, data map[string]interface{}) *Request {
+func RenewAuthRequest(path string, auth *Auth, data map[string]interface{}) *Request {
 	return &Request{
 		Operation: RenewOperation,
 		Path:      path,
@@ -207,8 +253,7 @@ func RenewAuthRequest(
 }
 
 // RevokeRequest creates the structure of the revoke request.
-func RevokeRequest(
-	path string, secret *Secret, data map[string]interface{}) *Request {
+func RevokeRequest(path string, secret *Secret, data map[string]interface{}) *Request {
 	return &Request{
 		Operation: RevokeOperation,
 		Path:      path,
@@ -246,18 +291,4 @@ const (
 	RollbackOperation           = "rollback"
 )
 
-var (
-	// ErrUnsupportedOperation is returned if the operation is not supported
-	// by the logical backend.
-	ErrUnsupportedOperation = errors.New("unsupported operation")
-
-	// ErrUnsupportedPath is returned if the path is not supported
-	// by the logical backend.
-	ErrUnsupportedPath = errors.New("unsupported path")
-
-	// ErrInvalidRequest is returned if the request is invalid
-	ErrInvalidRequest = errors.New("invalid request")
-
-	// ErrPermissionDenied is returned if the client is not authorized
-	ErrPermissionDenied = errors.New("permission denied")
-)
+type MFACreds map[string][]string

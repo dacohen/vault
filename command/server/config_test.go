@@ -6,14 +6,14 @@ import (
 	"testing"
 	"time"
 
+	log "github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/hcl"
 	"github.com/hashicorp/hcl/hcl/ast"
-	"github.com/hashicorp/vault/helper/logformat"
-	log "github.com/mgutz/logxi/v1"
+	"github.com/hashicorp/vault/helper/logging"
 )
 
 func TestLoadConfigFile(t *testing.T) {
-	logger := logformat.NewVaultLogger(log.LevelTrace)
+	logger := logging.NewVaultLogger(log.Debug)
 
 	config, err := LoadConfigFile("./test-fixtures/config.hcl", logger)
 	if err != nil {
@@ -48,22 +48,28 @@ func TestLoadConfigFile(t *testing.T) {
 		},
 
 		Telemetry: &Telemetry{
-			StatsdAddr:      "bar",
-			StatsiteAddr:    "foo",
-			DisableHostname: false,
-			DogStatsDAddr:   "127.0.0.1:7254",
-			DogStatsDTags:   []string{"tag_1:val_1", "tag_2:val_2"},
+			StatsdAddr:              "bar",
+			StatsiteAddr:            "foo",
+			DisableHostname:         false,
+			DogStatsDAddr:           "127.0.0.1:7254",
+			DogStatsDTags:           []string{"tag_1:val_1", "tag_2:val_2"},
+			PrometheusRetentionTime: prometheusDefaultRetentionTime,
 		},
 
-		DisableCache:    true,
-		DisableCacheRaw: true,
-		DisableMlock:    true,
-		DisableMlockRaw: true,
-		EnableUI:        true,
-		EnableUIRaw:     true,
+		DisableCache:             true,
+		DisableCacheRaw:          true,
+		DisableMlock:             true,
+		DisableMlockRaw:          true,
+		DisablePrintableCheckRaw: true,
+		DisablePrintableCheck:    true,
+		EnableUI:                 true,
+		EnableUIRaw:              true,
 
 		EnableRawEndpoint:    true,
 		EnableRawEndpointRaw: true,
+
+		DisableSealWrap:    true,
+		DisableSealWrapRaw: true,
 
 		MaxLeaseTTL:        10 * time.Hour,
 		MaxLeaseTTLRaw:     "10h",
@@ -78,8 +84,84 @@ func TestLoadConfigFile(t *testing.T) {
 	}
 }
 
+func TestLoadConfigFile_topLevel(t *testing.T) {
+	logger := logging.NewVaultLogger(log.Debug)
+
+	config, err := LoadConfigFile("./test-fixtures/config2.hcl", logger)
+	if err != nil {
+		t.Fatalf("err: %s", err)
+	}
+
+	expected := &Config{
+		Listeners: []*Listener{
+			&Listener{
+				Type: "tcp",
+				Config: map[string]interface{}{
+					"address": "127.0.0.1:443",
+				},
+			},
+		},
+
+		Storage: &Storage{
+			Type:         "consul",
+			RedirectAddr: "top_level_api_addr",
+			ClusterAddr:  "top_level_cluster_addr",
+			Config: map[string]string{
+				"foo": "bar",
+			},
+		},
+
+		HAStorage: &Storage{
+			Type:         "consul",
+			RedirectAddr: "top_level_api_addr",
+			ClusterAddr:  "top_level_cluster_addr",
+			Config: map[string]string{
+				"bar": "baz",
+			},
+			DisableClustering: true,
+		},
+
+		Telemetry: &Telemetry{
+			StatsdAddr:                 "bar",
+			StatsiteAddr:               "foo",
+			DisableHostname:            false,
+			DogStatsDAddr:              "127.0.0.1:7254",
+			DogStatsDTags:              []string{"tag_1:val_1", "tag_2:val_2"},
+			PrometheusRetentionTime:    30 * time.Second,
+			PrometheusRetentionTimeRaw: "30s",
+		},
+
+		DisableCache:    true,
+		DisableCacheRaw: true,
+		DisableMlock:    true,
+		DisableMlockRaw: true,
+		EnableUI:        true,
+		EnableUIRaw:     true,
+
+		EnableRawEndpoint:    true,
+		EnableRawEndpointRaw: true,
+
+		DisableSealWrap:    true,
+		DisableSealWrapRaw: true,
+
+		MaxLeaseTTL:        10 * time.Hour,
+		MaxLeaseTTLRaw:     "10h",
+		DefaultLeaseTTL:    10 * time.Hour,
+		DefaultLeaseTTLRaw: "10h",
+		ClusterName:        "testcluster",
+
+		PidFile: "./pidfile",
+
+		APIAddr:     "top_level_api_addr",
+		ClusterAddr: "top_level_cluster_addr",
+	}
+	if !reflect.DeepEqual(config, expected) {
+		t.Fatalf("expected \n\n%#v\n\n to be \n\n%#v\n\n", config, expected)
+	}
+}
+
 func TestLoadConfigFile_json(t *testing.T) {
-	logger := logformat.NewVaultLogger(log.LevelTrace)
+	logger := logging.NewVaultLogger(log.Debug)
 
 	config, err := LoadConfigFile("./test-fixtures/config.hcl.json", logger)
 	if err != nil {
@@ -123,6 +205,7 @@ func TestLoadConfigFile_json(t *testing.T) {
 			CirconusCheckTags:                  "",
 			CirconusBrokerID:                   "",
 			CirconusBrokerSelectTag:            "",
+			PrometheusRetentionTime:            prometheusDefaultRetentionTime,
 		},
 
 		MaxLeaseTTL:          10 * time.Hour,
@@ -137,6 +220,8 @@ func TestLoadConfigFile_json(t *testing.T) {
 		PidFile:              "./pidfile",
 		EnableRawEndpoint:    true,
 		EnableRawEndpointRaw: true,
+		DisableSealWrap:      true,
+		DisableSealWrapRaw:   true,
 	}
 	if !reflect.DeepEqual(config, expected) {
 		t.Fatalf("expected \n\n%#v\n\n to be \n\n%#v\n\n", config, expected)
@@ -144,7 +229,7 @@ func TestLoadConfigFile_json(t *testing.T) {
 }
 
 func TestLoadConfigFile_json2(t *testing.T) {
-	logger := logformat.NewVaultLogger(log.LevelTrace)
+	logger := logging.NewVaultLogger(log.Debug)
 
 	config, err := LoadConfigFile("./test-fixtures/config2.hcl.json", logger)
 	if err != nil {
@@ -188,6 +273,8 @@ func TestLoadConfigFile_json2(t *testing.T) {
 
 		EnableRawEndpoint: true,
 
+		DisableSealWrap: true,
+
 		Telemetry: &Telemetry{
 			StatsiteAddr:                       "foo",
 			StatsdAddr:                         "bar",
@@ -205,6 +292,8 @@ func TestLoadConfigFile_json2(t *testing.T) {
 			CirconusCheckTags:                  "cat1:tag1,cat2:tag2",
 			CirconusBrokerID:                   "0",
 			CirconusBrokerSelectTag:            "dc:sfo",
+			PrometheusRetentionTime:            30 * time.Second,
+			PrometheusRetentionTimeRaw:         "30s",
 		},
 	}
 	if !reflect.DeepEqual(config, expected) {
@@ -212,7 +301,7 @@ func TestLoadConfigFile_json2(t *testing.T) {
 }
 
 func TestLoadConfigDir(t *testing.T) {
-	logger := logformat.NewVaultLogger(log.LevelTrace)
+	logger := logging.NewVaultLogger(log.Debug)
 
 	config, err := LoadConfigDir("./test-fixtures/config-dir", logger)
 	if err != nil {
@@ -222,6 +311,12 @@ func TestLoadConfigDir(t *testing.T) {
 	expected := &Config{
 		DisableCache: true,
 		DisableMlock: true,
+
+		DisableClustering:    false,
+		DisableClusteringRaw: false,
+
+		APIAddr:     "https://vault.local",
+		ClusterAddr: "https://127.0.0.1:444",
 
 		Listeners: []*Listener{
 			&Listener{
@@ -237,7 +332,9 @@ func TestLoadConfigDir(t *testing.T) {
 			Config: map[string]string{
 				"foo": "bar",
 			},
-			DisableClustering: true,
+			RedirectAddr:      "https://vault.local",
+			ClusterAddr:       "https://127.0.0.1:444",
+			DisableClustering: false,
 		},
 
 		EnableUI: true,
@@ -245,9 +342,10 @@ func TestLoadConfigDir(t *testing.T) {
 		EnableRawEndpoint: true,
 
 		Telemetry: &Telemetry{
-			StatsiteAddr:    "qux",
-			StatsdAddr:      "baz",
-			DisableHostname: true,
+			StatsiteAddr:            "qux",
+			StatsdAddr:              "baz",
+			DisableHostname:         true,
+			PrometheusRetentionTime: prometheusDefaultRetentionTime,
 		},
 
 		MaxLeaseTTL:     10 * time.Hour,
@@ -309,74 +407,4 @@ listener "tcp" {
 		t.Fatalf("expected \n\n%#v\n\n to be \n\n%#v\n\n", config, *expected)
 	}
 
-}
-
-func TestParseConfig_badTopLevel(t *testing.T) {
-	logger := logformat.NewVaultLogger(log.LevelTrace)
-
-	_, err := ParseConfig(strings.TrimSpace(`
-backend {}
-bad  = "one"
-nope = "yes"
-`), logger)
-
-	if err == nil {
-		t.Fatal("expected error")
-	}
-
-	if !strings.Contains(err.Error(), "invalid key 'bad' on line 2") {
-		t.Errorf("bad error: %q", err)
-	}
-
-	if !strings.Contains(err.Error(), "invalid key 'nope' on line 3") {
-		t.Errorf("bad error: %q", err)
-	}
-}
-
-func TestParseConfig_badListener(t *testing.T) {
-	logger := logformat.NewVaultLogger(log.LevelTrace)
-
-	_, err := ParseConfig(strings.TrimSpace(`
-listener "tcp" {
-	address = "1.2.3.3"
-	bad  = "one"
-	nope = "yes"
-}
-`), logger)
-
-	if err == nil {
-		t.Fatal("expected error")
-	}
-
-	if !strings.Contains(err.Error(), "listeners.tcp: invalid key 'bad' on line 3") {
-		t.Errorf("bad error: %q", err)
-	}
-
-	if !strings.Contains(err.Error(), "listeners.tcp: invalid key 'nope' on line 4") {
-		t.Errorf("bad error: %q", err)
-	}
-}
-
-func TestParseConfig_badTelemetry(t *testing.T) {
-	logger := logformat.NewVaultLogger(log.LevelTrace)
-
-	_, err := ParseConfig(strings.TrimSpace(`
-telemetry {
-	statsd_address = "1.2.3.3"
-	bad  = "one"
-	nope = "yes"
-}
-`), logger)
-
-	if err == nil {
-		t.Fatal("expected error")
-	}
-
-	if !strings.Contains(err.Error(), "telemetry: invalid key 'bad' on line 3") {
-		t.Errorf("bad error: %q", err)
-	}
-
-	if !strings.Contains(err.Error(), "telemetry: invalid key 'nope' on line 4") {
-		t.Errorf("bad error: %q", err)
-	}
 }

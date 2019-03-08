@@ -8,7 +8,7 @@ import (
 
 // ErrServerShutdown is returned from server Serve methods when Shutdown
 // has been called and handlers are still completing.
-var ErrServerShutdown = errors.New("radius: server is shutting down")
+var ErrServerShutdown = errors.New("radius: server shutdown")
 
 // Handler provides a handler to RADIUS server requests. When a RADIUS request
 // is received, ServeRADIUS is called.
@@ -26,9 +26,14 @@ func (h HandlerFunc) ServeRADIUS(w ResponseWriter, r *Request) {
 
 // Request is an incoming RADIUS request that is being handled by the server.
 type Request struct {
-	LocalAddr  net.Addr
+	// LocalAddr is the local address on which the incoming RADIUS request
+	// was received.
+	LocalAddr net.Addr
+	// RemoteAddr is the address from which the incoming RADIUS request
+	// was sent.
 	RemoteAddr net.Addr
 
+	// Packet is the RADIUS packet sent in the request.
 	*Packet
 
 	ctx context.Context
@@ -64,17 +69,21 @@ type ResponseWriter interface {
 // authorizing and decrypting packets.
 //
 // ctx is canceled if the server's Shutdown method is called.
+//
+// Returning an empty secret will discard the incoming packet.
 type SecretSource interface {
 	RADIUSSecret(ctx context.Context, remoteAddr net.Addr) ([]byte, error)
 }
 
 // StaticSecretSource returns a SecretSource that uses secret for all requests.
 func StaticSecretSource(secret []byte) SecretSource {
-	return staticSecretSource(secret)
+	return &staticSecretSource{secret}
 }
 
-type staticSecretSource []byte
+type staticSecretSource struct {
+	secret []byte
+}
 
-func (secret staticSecretSource) RADIUSSecret(ctx context.Context, remoteAddr net.Addr) ([]byte, error) {
-	return []byte(secret), nil
+func (s *staticSecretSource) RADIUSSecret(ctx context.Context, remoteAddr net.Addr) ([]byte, error) {
+	return s.secret, nil
 }

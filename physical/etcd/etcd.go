@@ -3,15 +3,15 @@ package etcd
 import (
 	"context"
 	"errors"
-	"fmt"
 	"net/url"
 	"os"
 	"strings"
 
-	"github.com/coreos/etcd/client"
 	"github.com/coreos/go-semver/semver"
+	"github.com/hashicorp/errwrap"
+	log "github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/vault/physical"
-	log "github.com/mgutz/logxi/v1"
+	"go.etcd.io/etcd/client"
 )
 
 var (
@@ -22,7 +22,7 @@ var (
 	EtcdSemaphoreKeysEmptyError  = errors.New("lock queue is empty")
 	EtcdLockHeldError            = errors.New("lock already held")
 	EtcdLockNotHeldError         = errors.New("lock not held")
-	EtcdSemaphoreKeyRemovedError = errors.New("semaphore key removed before lock aquisition")
+	EtcdSemaphoreKeyRemovedError = errors.New("semaphore key removed before lock acquisition")
 	EtcdVersionUnknown           = errors.New("etcd: unknown API version")
 )
 
@@ -133,10 +133,11 @@ func getEtcdEndpoints(conf map[string]string) ([]string, error) {
 	}
 
 	if useSrv {
+		srvName, _ := getEtcdOption(conf, "discovery_srv_name", "ETCD_DISCOVERY_SRV_NAME")
 		discoverer := client.NewSRVDiscover()
-		endpoints, err := discoverer.Discover(domain)
+		endpoints, err := discoverer.Discover(domain, srvName)
 		if err != nil {
-			return nil, fmt.Errorf("failed to discover etcd endpoints through SRV discovery: %v", err)
+			return nil, errwrap.Wrapf("failed to discover etcd endpoints through SRV discovery: {{err}}", err)
 		}
 		return endpoints, nil
 	}

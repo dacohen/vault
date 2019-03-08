@@ -1,17 +1,17 @@
 package etcd
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"testing"
 	"time"
 
-	"github.com/hashicorp/vault/helper/logformat"
+	log "github.com/hashicorp/go-hclog"
+	"github.com/hashicorp/vault/helper/logging"
 	"github.com/hashicorp/vault/physical"
-	log "github.com/mgutz/logxi/v1"
 
-	"github.com/coreos/etcd/client"
-	"golang.org/x/net/context"
+	"go.etcd.io/etcd/client"
 )
 
 func TestEtcdBackend(t *testing.T) {
@@ -51,21 +51,22 @@ func TestEtcdBackend(t *testing.T) {
 
 	// Generate new etcd backend. The etcd address is read from ETCD_ADDR. No
 	// need to provide it explicitly.
-	logger := logformat.NewVaultLogger(log.LevelTrace)
-
-	b, err := NewEtcdBackend(map[string]string{
+	logger := logging.NewVaultLogger(log.Debug)
+	config := map[string]string{
 		"path": randPath,
-	}, logger)
+	}
+
+	b, err := NewEtcdBackend(config, logger)
+	if err != nil {
+		t.Fatalf("err: %s", err)
+	}
+
+	b2, err := NewEtcdBackend(config, logger)
 	if err != nil {
 		t.Fatalf("err: %s", err)
 	}
 
 	physical.ExerciseBackend(t, b)
 	physical.ExerciseBackend_ListPrefix(t, b)
-
-	ha, ok := b.(physical.HABackend)
-	if !ok {
-		t.Fatalf("etcd does not implement HABackend")
-	}
-	physical.ExerciseHABackend(t, ha, ha)
+	physical.ExerciseHABackend(t, b.(physical.HABackend), b2.(physical.HABackend))
 }

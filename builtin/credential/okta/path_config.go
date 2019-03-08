@@ -1,13 +1,14 @@
 package okta
 
 import (
+	"context"
 	"fmt"
 	"net/url"
 
 	"time"
 
 	"github.com/chrismalek/oktasdk-go/okta"
-	"github.com/hashicorp/go-cleanhttp"
+	cleanhttp "github.com/hashicorp/go-cleanhttp"
 	"github.com/hashicorp/vault/logical"
 	"github.com/hashicorp/vault/logical/framework"
 )
@@ -24,26 +25,32 @@ func pathConfig(b *backend) *framework.Path {
 			"organization": &framework.FieldSchema{
 				Type:        framework.TypeString,
 				Description: "(DEPRECATED) Okta organization to authenticate against. Use org_name instead.",
+				Deprecated:  true,
 			},
 			"org_name": &framework.FieldSchema{
 				Type:        framework.TypeString,
 				Description: "Name of the organization to be used in the Okta API.",
+				DisplayName: "Organization Name",
 			},
 			"token": &framework.FieldSchema{
 				Type:        framework.TypeString,
 				Description: "(DEPRECATED) Okta admin API token.  Use api_token instead.",
+				Deprecated:  true,
 			},
 			"api_token": &framework.FieldSchema{
 				Type:        framework.TypeString,
 				Description: "Okta API key.",
+				DisplayName: "API Token",
 			},
 			"base_url": &framework.FieldSchema{
 				Type:        framework.TypeString,
-				Description: `The base domain to use for the Okta API. When not specified in the configuraiton, "okta.com" is used.`,
+				Description: `The base domain to use for the Okta API. When not specified in the configuration, "okta.com" is used.`,
+				DisplayName: "Base URL",
 			},
 			"production": &framework.FieldSchema{
 				Type:        framework.TypeBool,
 				Description: `(DEPRECATED) Use base_url.`,
+				Deprecated:  true,
 			},
 			"ttl": &framework.FieldSchema{
 				Type:        framework.TypeDurationSecond,
@@ -52,6 +59,11 @@ func pathConfig(b *backend) *framework.Path {
 			"max_ttl": &framework.FieldSchema{
 				Type:        framework.TypeDurationSecond,
 				Description: `Maximum duration after which authentication will be expired`,
+			},
+			"bypass_okta_mfa": &framework.FieldSchema{
+				Type:        framework.TypeBool,
+				Description: `When set true, requests by Okta for a MFA check will be bypassed. This also disallows certain status checks on the account, such as whether the password is expired.`,
+				DisplayName: "Bypass Okta MFA",
 			},
 		},
 
@@ -68,8 +80,8 @@ func pathConfig(b *backend) *framework.Path {
 }
 
 // Config returns the configuration for this backend.
-func (b *backend) Config(s logical.Storage) (*ConfigEntry, error) {
-	entry, err := s.Get("config")
+func (b *backend) Config(ctx context.Context, s logical.Storage) (*ConfigEntry, error) {
+	entry, err := s.Get(ctx, "config")
 	if err != nil {
 		return nil, err
 	}
@@ -87,10 +99,8 @@ func (b *backend) Config(s logical.Storage) (*ConfigEntry, error) {
 	return &result, nil
 }
 
-func (b *backend) pathConfigRead(
-	req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
-
-	cfg, err := b.Config(req.Storage)
+func (b *backend) pathConfigRead(ctx context.Context, req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
+	cfg, err := b.Config(ctx, req.Storage)
 	if err != nil {
 		return nil, err
 	}
@@ -100,10 +110,11 @@ func (b *backend) pathConfigRead(
 
 	resp := &logical.Response{
 		Data: map[string]interface{}{
-			"organization": cfg.Org,
-			"org_name":     cfg.Org,
-			"ttl":          cfg.TTL,
-			"max_ttl":      cfg.MaxTTL,
+			"organization":    cfg.Org,
+			"org_name":        cfg.Org,
+			"ttl":             cfg.TTL.Seconds(),
+			"max_ttl":         cfg.MaxTTL.Seconds(),
+			"bypass_okta_mfa": cfg.BypassOktaMFA,
 		},
 	}
 	if cfg.BaseURL != "" {
@@ -113,12 +124,15 @@ func (b *backend) pathConfigRead(
 		resp.Data["production"] = *cfg.Production
 	}
 
+	if cfg.BypassOktaMFA {
+		resp.AddWarning("Okta MFA bypass is configured. In addition to ignoring Okta MFA requests, certain other account statuses will not be seen, such as PASSWORD_EXPIRED. Authentication will succeed in these cases.")
+	}
+
 	return resp, nil
 }
 
-func (b *backend) pathConfigWrite(
-	req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
-	cfg, err := b.Config(req.Storage)
+func (b *backend) pathConfigWrite(ctx context.Context, req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
+	cfg, err := b.Config(ctx, req.Storage)
 	if err != nil {
 		return nil, err
 	}
@@ -146,12 +160,8 @@ func (b *backend) pathConfigWrite(
 	token, ok := d.GetOk("api_token")
 	if ok {
 		cfg.Token = token.(string)
-	}
-	if cfg.Token == "" {
-		token, ok = d.GetOk("token")
-		if ok {
-			cfg.Token = token.(string)
-		}
+	} else if token, ok = d.GetOk("token"); ok {
+		cfg.Token = token.(string)
 	}
 
 	baseURLRaw, ok := d.GetOk("base_url")
@@ -177,6 +187,11 @@ func (b *backend) pathConfigWrite(
 		cfg.Production = nil
 	}
 
+	bypass, ok := d.GetOk("bypass_okta_mfa")
+	if ok {
+		cfg.BypassOktaMFA = bypass.(bool)
+	}
+
 	ttl, ok := d.GetOk("ttl")
 	if ok {
 		cfg.TTL = time.Duration(ttl.(int)) * time.Second
@@ -195,16 +210,21 @@ func (b *backend) pathConfigWrite(
 	if err != nil {
 		return nil, err
 	}
-	if err := req.Storage.Put(jsonCfg); err != nil {
+	if err := req.Storage.Put(ctx, jsonCfg); err != nil {
 		return nil, err
 	}
 
-	return nil, nil
+	var resp *logical.Response
+	if cfg.BypassOktaMFA {
+		resp = new(logical.Response)
+		resp.AddWarning("Okta MFA bypass is configured. In addition to ignoring Okta MFA requests, certain other account statuses will not be seen, such as PASSWORD_EXPIRED. Authentication will succeed in these cases.")
+	}
+
+	return resp, nil
 }
 
-func (b *backend) pathConfigExistenceCheck(
-	req *logical.Request, d *framework.FieldData) (bool, error) {
-	cfg, err := b.Config(req.Storage)
+func (b *backend) pathConfigExistenceCheck(ctx context.Context, req *logical.Request, d *framework.FieldData) (bool, error) {
+	cfg, err := b.Config(ctx, req.Storage)
 	if err != nil {
 		return false, err
 	}
@@ -231,12 +251,13 @@ func (c *ConfigEntry) OktaClient() *okta.Client {
 
 // ConfigEntry for Okta
 type ConfigEntry struct {
-	Org        string        `json:"organization"`
-	Token      string        `json:"token"`
-	BaseURL    string        `json:"base_url"`
-	Production *bool         `json:"is_production,omitempty"`
-	TTL        time.Duration `json:"ttl"`
-	MaxTTL     time.Duration `json:"max_ttl"`
+	Org           string        `json:"organization"`
+	Token         string        `json:"token"`
+	BaseURL       string        `json:"base_url"`
+	Production    *bool         `json:"is_production,omitempty"`
+	TTL           time.Duration `json:"ttl"`
+	MaxTTL        time.Duration `json:"max_ttl"`
+	BypassOktaMFA bool          `json:"bypass_okta_mfa"`
 }
 
 const pathConfigHelp = `

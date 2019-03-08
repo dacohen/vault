@@ -2,6 +2,7 @@ package s3
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"net/http"
@@ -11,9 +12,9 @@ import (
 	"strings"
 	"time"
 
-	log "github.com/mgutz/logxi/v1"
+	log "github.com/hashicorp/go-hclog"
 
-	"github.com/armon/go-metrics"
+	metrics "github.com/armon/go-metrics"
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/awserr"
 	"github.com/aws/aws-sdk-go/aws/session"
@@ -22,13 +23,18 @@ import (
 	cleanhttp "github.com/hashicorp/go-cleanhttp"
 	"github.com/hashicorp/vault/helper/awsutil"
 	"github.com/hashicorp/vault/helper/consts"
+	"github.com/hashicorp/vault/helper/parseutil"
 	"github.com/hashicorp/vault/physical"
 )
+
+// Verify S3Backend satisfies the correct interfaces
+var _ physical.Backend = (*S3Backend)(nil)
 
 // S3Backend is a physical backend that stores data
 // within an S3 bucket.
 type S3Backend struct {
 	bucket     string
+	kmsKeyId   string
 	client     *s3.S3
 	logger     log.Logger
 	permitPool *physical.PermitPool
@@ -72,6 +78,22 @@ func NewS3Backend(conf map[string]string, logger log.Logger) (physical.Backend, 
 			}
 		}
 	}
+	s3ForcePathStyleStr, ok := conf["s3_force_path_style"]
+	if !ok {
+		s3ForcePathStyleStr = "false"
+	}
+	s3ForcePathStyleBool, err := parseutil.ParseBool(s3ForcePathStyleStr)
+	if err != nil {
+		return nil, fmt.Errorf("invalid boolean set for s3_force_path_style: %q", s3ForcePathStyleStr)
+	}
+	disableSSLStr, ok := conf["disable_ssl"]
+	if !ok {
+		disableSSLStr = "false"
+	}
+	disableSSLBool, err := parseutil.ParseBool(disableSSLStr)
+	if err != nil {
+		return nil, fmt.Errorf("invalid boolean set for disable_ssl: %q", disableSSLStr)
+	}
 
 	credsConfig := &awsutil.CredentialsConfig{
 		AccessKey:    accessKey,
@@ -91,13 +113,15 @@ func NewS3Backend(conf map[string]string, logger log.Logger) (physical.Backend, 
 		HTTPClient: &http.Client{
 			Transport: pooledTransport,
 		},
-		Endpoint: aws.String(endpoint),
-		Region:   aws.String(region),
+		Endpoint:         aws.String(endpoint),
+		Region:           aws.String(region),
+		S3ForcePathStyle: aws.Bool(s3ForcePathStyleBool),
+		DisableSSL:       aws.Bool(disableSSLBool),
 	}))
 
 	_, err = s3conn.ListObjects(&s3.ListObjectsInput{Bucket: &bucket})
 	if err != nil {
-		return nil, fmt.Errorf("unable to access bucket '%s' in region %s: %v", bucket, region, err)
+		return nil, errwrap.Wrapf(fmt.Sprintf("unable to access bucket %q in region %q: {{err}}", bucket, region), err)
 	}
 
 	maxParStr, ok := conf["max_parallel"]
@@ -108,13 +132,19 @@ func NewS3Backend(conf map[string]string, logger log.Logger) (physical.Backend, 
 			return nil, errwrap.Wrapf("failed parsing max_parallel parameter: {{err}}", err)
 		}
 		if logger.IsDebug() {
-			logger.Debug("s3: max_parallel set", "max_parallel", maxParInt)
+			logger.Debug("max_parallel set", "max_parallel", maxParInt)
 		}
+	}
+
+	kmsKeyId, ok := conf["kms_key_id"]
+	if !ok {
+		kmsKeyId = ""
 	}
 
 	s := &S3Backend{
 		client:     s3conn,
 		bucket:     bucket,
+		kmsKeyId:   kmsKeyId,
 		logger:     logger,
 		permitPool: physical.NewPermitPool(maxParInt),
 	}
@@ -122,17 +152,24 @@ func NewS3Backend(conf map[string]string, logger log.Logger) (physical.Backend, 
 }
 
 // Put is used to insert or update an entry
-func (s *S3Backend) Put(entry *physical.Entry) error {
+func (s *S3Backend) Put(ctx context.Context, entry *physical.Entry) error {
 	defer metrics.MeasureSince([]string{"s3", "put"}, time.Now())
 
 	s.permitPool.Acquire()
 	defer s.permitPool.Release()
 
-	_, err := s.client.PutObject(&s3.PutObjectInput{
+	putObjectInput := &s3.PutObjectInput{
 		Bucket: aws.String(s.bucket),
 		Key:    aws.String(entry.Key),
 		Body:   bytes.NewReader(entry.Value),
-	})
+	}
+
+	if s.kmsKeyId != "" {
+		putObjectInput.ServerSideEncryption = aws.String("aws:kms")
+		putObjectInput.SSEKMSKeyId = aws.String(s.kmsKeyId)
+	}
+
+	_, err := s.client.PutObject(putObjectInput)
 
 	if err != nil {
 		return err
@@ -142,7 +179,7 @@ func (s *S3Backend) Put(entry *physical.Entry) error {
 }
 
 // Get is used to fetch an entry
-func (s *S3Backend) Get(key string) (*physical.Entry, error) {
+func (s *S3Backend) Get(ctx context.Context, key string) (*physical.Entry, error) {
 	defer metrics.MeasureSince([]string{"s3", "get"}, time.Now())
 
 	s.permitPool.Acquire()
@@ -152,6 +189,9 @@ func (s *S3Backend) Get(key string) (*physical.Entry, error) {
 		Bucket: aws.String(s.bucket),
 		Key:    aws.String(key),
 	})
+	if resp != nil && resp.Body != nil {
+		defer resp.Body.Close()
+	}
 	if awsErr, ok := err.(awserr.RequestFailure); ok {
 		// Return nil on 404s, error on anything else
 		if awsErr.StatusCode() == 404 {
@@ -166,22 +206,25 @@ func (s *S3Backend) Get(key string) (*physical.Entry, error) {
 		return nil, fmt.Errorf("got nil response from S3 but no error")
 	}
 
-	data := make([]byte, *resp.ContentLength)
-	_, err = io.ReadFull(resp.Body, data)
+	data := bytes.NewBuffer(nil)
+	if resp.ContentLength != nil {
+		data = bytes.NewBuffer(make([]byte, 0, *resp.ContentLength))
+	}
+	_, err = io.Copy(data, resp.Body)
 	if err != nil {
 		return nil, err
 	}
 
 	ent := &physical.Entry{
 		Key:   key,
-		Value: data,
+		Value: data.Bytes(),
 	}
 
 	return ent, nil
 }
 
 // Delete is used to permanently delete an entry
-func (s *S3Backend) Delete(key string) error {
+func (s *S3Backend) Delete(ctx context.Context, key string) error {
 	defer metrics.MeasureSince([]string{"s3", "delete"}, time.Now())
 
 	s.permitPool.Acquire()
@@ -201,7 +244,7 @@ func (s *S3Backend) Delete(key string) error {
 
 // List is used to list all the keys under a given
 // prefix, up to the next prefix.
-func (s *S3Backend) List(prefix string) ([]string, error) {
+func (s *S3Backend) List(ctx context.Context, prefix string) ([]string, error) {
 	defer metrics.MeasureSince([]string{"s3", "list"}, time.Now())
 
 	s.permitPool.Acquire()

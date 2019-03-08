@@ -5,8 +5,8 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"strings"
 	"testing"
-	"time"
 )
 
 func init() {
@@ -95,6 +95,30 @@ func TestClientToken(t *testing.T) {
 	}
 }
 
+func TestClientBadToken(t *testing.T) {
+	handler := func(w http.ResponseWriter, req *http.Request) {}
+
+	config, ln := testHTTPServer(t, http.HandlerFunc(handler))
+	defer ln.Close()
+
+	client, err := NewClient(config)
+	if err != nil {
+		t.Fatalf("err: %s", err)
+	}
+
+	client.SetToken("foo")
+	_, err = client.RawRequest(client.NewRequest("PUT", "/"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	client.SetToken("foo\u007f")
+	_, err = client.RawRequest(client.NewRequest("PUT", "/"))
+	if err == nil || !strings.Contains(err.Error(), "printable") {
+		t.Fatalf("expected error due to bad token")
+	}
+}
+
 func TestClientRedirect(t *testing.T) {
 	primary := func(w http.ResponseWriter, req *http.Request) {
 		w.Write([]byte("test"))
@@ -139,19 +163,19 @@ func TestClientEnvSettings(t *testing.T) {
 	oldCAPath := os.Getenv(EnvVaultCAPath)
 	oldClientCert := os.Getenv(EnvVaultClientCert)
 	oldClientKey := os.Getenv(EnvVaultClientKey)
-	oldSkipVerify := os.Getenv(EnvVaultInsecure)
+	oldSkipVerify := os.Getenv(EnvVaultSkipVerify)
 	oldMaxRetries := os.Getenv(EnvVaultMaxRetries)
 	os.Setenv(EnvVaultCACert, cwd+"/test-fixtures/keys/cert.pem")
 	os.Setenv(EnvVaultCAPath, cwd+"/test-fixtures/keys")
 	os.Setenv(EnvVaultClientCert, cwd+"/test-fixtures/keys/cert.pem")
 	os.Setenv(EnvVaultClientKey, cwd+"/test-fixtures/keys/key.pem")
-	os.Setenv(EnvVaultInsecure, "true")
+	os.Setenv(EnvVaultSkipVerify, "true")
 	os.Setenv(EnvVaultMaxRetries, "5")
 	defer os.Setenv(EnvVaultCACert, oldCACert)
 	defer os.Setenv(EnvVaultCAPath, oldCAPath)
 	defer os.Setenv(EnvVaultClientCert, oldClientCert)
 	defer os.Setenv(EnvVaultClientKey, oldClientKey)
-	defer os.Setenv(EnvVaultInsecure, oldSkipVerify)
+	defer os.Setenv(EnvVaultSkipVerify, oldSkipVerify)
 	defer os.Setenv(EnvVaultMaxRetries, oldMaxRetries)
 
 	config := DefaultConfig()
@@ -163,11 +187,53 @@ func TestClientEnvSettings(t *testing.T) {
 	if len(tlsConfig.RootCAs.Subjects()) == 0 {
 		t.Fatalf("bad: expected a cert pool with at least one subject")
 	}
-	if len(tlsConfig.Certificates) != 1 {
-		t.Fatalf("bad: expected client tls config to have a client certificate")
+	if tlsConfig.GetClientCertificate == nil {
+		t.Fatalf("bad: expected client tls config to have a certificate getter")
 	}
 	if tlsConfig.InsecureSkipVerify != true {
 		t.Fatalf("bad: %v", tlsConfig.InsecureSkipVerify)
+	}
+}
+
+func TestParsingRateAndBurst(t *testing.T) {
+	var (
+		correctFormat                    = "400:400"
+		observedRate, observedBurst, err = parseRateLimit(correctFormat)
+		expectedRate, expectedBurst      = float64(400), 400
+	)
+	if err != nil {
+		t.Error(err)
+	}
+	if expectedRate != observedRate {
+		t.Errorf("Expected rate %v but found %v", expectedRate, observedRate)
+	}
+	if expectedBurst != observedBurst {
+		t.Errorf("Expected burst %v but found %v", expectedRate, observedRate)
+	}
+}
+
+func TestParsingRateOnly(t *testing.T) {
+	var (
+		correctFormat                    = "400"
+		observedRate, observedBurst, err = parseRateLimit(correctFormat)
+		expectedRate, expectedBurst      = float64(400), 400
+	)
+	if err != nil {
+		t.Error(err)
+	}
+	if expectedRate != observedRate {
+		t.Errorf("Expected rate %v but found %v", expectedRate, observedRate)
+	}
+	if expectedBurst != observedBurst {
+		t.Errorf("Expected burst %v but found %v", expectedRate, observedRate)
+	}
+}
+
+func TestParsingErrorCase(t *testing.T) {
+	var incorrectFormat = "foobar"
+	var _, _, err = parseRateLimit(incorrectFormat)
+	if err == nil {
+		t.Error("Expected error, found no error")
 	}
 }
 
@@ -177,22 +243,10 @@ func TestClientTimeoutSetting(t *testing.T) {
 	defer os.Setenv(EnvVaultClientTimeout, oldClientTimeout)
 	config := DefaultConfig()
 	config.ReadEnvironment()
-	client, err := NewClient(config)
+	_, err := NewClient(config)
 	if err != nil {
 		t.Fatal(err)
 	}
-	_ = client.NewRequest("PUT", "/")
-	if client.config.HttpClient.Timeout != time.Second*10 {
-		t.Fatalf("error setting client timeout using env variable")
-	}
-
-	// Setting custom client timeout for a new request
-	client.SetClientTimeout(time.Second * 20)
-	_ = client.NewRequest("PUT", "/")
-	if client.config.HttpClient.Timeout != time.Second*20 {
-		t.Fatalf("error setting client timeout using SetClientTimeout")
-	}
-
 }
 
 type roundTripperFunc func(*http.Request) (*http.Response, error)
@@ -212,4 +266,17 @@ func TestClientNonTransportRoundTripper(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+}
+
+func TestClone(t *testing.T) {
+	client1, err1 := NewClient(nil)
+	if err1 != nil {
+		t.Fatalf("NewClient failed: %v", err1)
+	}
+	client2, err2 := client1.Clone()
+	if err2 != nil {
+		t.Fatalf("Clone failed: %v", err2)
+	}
+
+	_ = client2
 }

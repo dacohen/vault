@@ -1,10 +1,13 @@
 package kubeauth
 
 import (
+	"context"
 	"fmt"
 	"strings"
 	"time"
 
+	"github.com/hashicorp/go-sockaddr"
+	"github.com/hashicorp/vault/helper/parseutil"
 	"github.com/hashicorp/vault/helper/policyutil"
 	"github.com/hashicorp/vault/helper/strutil"
 	"github.com/hashicorp/vault/logical"
@@ -65,8 +68,13 @@ should never expire. The token should be renewed within the
 duration specified by this value. At each renewal, the token's
 TTL will be set to the value of this parameter.`,
 				},
+				"bound_cidrs": &framework.FieldSchema{
+					Type: framework.TypeCommaStringSlice,
+					Description: `Comma separated string or list of CIDR blocks. If set, specifies the blocks of
+IP addresses which can perform the login operation.`,
+				},
 			},
-			ExistenceCheck: b.pathRoleExistenceCheck,
+			ExistenceCheck: b.pathRoleExistenceCheck(),
 			Callbacks: map[logical.Operation]framework.OperationFunc{
 				logical.CreateOperation: b.pathRoleCreateUpdate(),
 				logical.UpdateOperation: b.pathRoleCreateUpdate(),
@@ -80,24 +88,26 @@ TTL will be set to the value of this parameter.`,
 }
 
 // pathRoleExistenceCheck returns whether the role with the given name exists or not.
-func (b *kubeAuthBackend) pathRoleExistenceCheck(req *logical.Request, data *framework.FieldData) (bool, error) {
-	b.l.RLock()
-	defer b.l.RUnlock()
+func (b *kubeAuthBackend) pathRoleExistenceCheck() framework.ExistenceFunc {
+	return func(ctx context.Context, req *logical.Request, data *framework.FieldData) (bool, error) {
+		b.l.RLock()
+		defer b.l.RUnlock()
 
-	role, err := b.role(req.Storage, data.Get("name").(string))
-	if err != nil {
-		return false, err
+		role, err := b.role(ctx, req.Storage, data.Get("name").(string))
+		if err != nil {
+			return false, err
+		}
+		return role != nil, nil
 	}
-	return role != nil, nil
 }
 
 // pathRoleList is used to list all the Roles registered with the backend.
 func (b *kubeAuthBackend) pathRoleList() framework.OperationFunc {
-	return func(req *logical.Request, data *framework.FieldData) (*logical.Response, error) {
+	return func(ctx context.Context, req *logical.Request, data *framework.FieldData) (*logical.Response, error) {
 		b.l.RLock()
 		defer b.l.RUnlock()
 
-		roles, err := req.Storage.List("role/")
+		roles, err := req.Storage.List(ctx, "role/")
 		if err != nil {
 			return nil, err
 		}
@@ -107,7 +117,7 @@ func (b *kubeAuthBackend) pathRoleList() framework.OperationFunc {
 
 // pathRoleRead grabs a read lock and reads the options set on the role from the storage
 func (b *kubeAuthBackend) pathRoleRead() framework.OperationFunc {
-	return func(req *logical.Request, data *framework.FieldData) (*logical.Response, error) {
+	return func(ctx context.Context, req *logical.Request, data *framework.FieldData) (*logical.Response, error) {
 		roleName := data.Get("name").(string)
 		if roleName == "" {
 			return logical.ErrorResponse("missing name"), nil
@@ -116,7 +126,7 @@ func (b *kubeAuthBackend) pathRoleRead() framework.OperationFunc {
 		b.l.RLock()
 		defer b.l.RUnlock()
 
-		role, err := b.role(req.Storage, roleName)
+		role, err := b.role(ctx, req.Storage, roleName)
 		if err != nil {
 			return nil, err
 		}
@@ -139,6 +149,7 @@ func (b *kubeAuthBackend) pathRoleRead() framework.OperationFunc {
 				"policies":                         role.Policies,
 				"period":                           role.Period,
 				"ttl":                              role.TTL,
+				"bound_cidrs":                      role.BoundCIDRs,
 			},
 		}
 
@@ -148,7 +159,7 @@ func (b *kubeAuthBackend) pathRoleRead() framework.OperationFunc {
 
 // pathRoleDelete removes the role from storage
 func (b *kubeAuthBackend) pathRoleDelete() framework.OperationFunc {
-	return func(req *logical.Request, data *framework.FieldData) (*logical.Response, error) {
+	return func(ctx context.Context, req *logical.Request, data *framework.FieldData) (*logical.Response, error) {
 		roleName := data.Get("name").(string)
 		if roleName == "" {
 			return logical.ErrorResponse("missing role name"), nil
@@ -159,7 +170,7 @@ func (b *kubeAuthBackend) pathRoleDelete() framework.OperationFunc {
 		defer b.l.Unlock()
 
 		// Delete the role itself
-		if err := req.Storage.Delete("role/" + strings.ToLower(roleName)); err != nil {
+		if err := req.Storage.Delete(ctx, "role/"+strings.ToLower(roleName)); err != nil {
 			return nil, err
 		}
 
@@ -170,7 +181,7 @@ func (b *kubeAuthBackend) pathRoleDelete() framework.OperationFunc {
 // pathRoleCreateUpdate registers a new role with the backend or updates the options
 // of an existing role
 func (b *kubeAuthBackend) pathRoleCreateUpdate() framework.OperationFunc {
-	return func(req *logical.Request, data *framework.FieldData) (*logical.Response, error) {
+	return func(ctx context.Context, req *logical.Request, data *framework.FieldData) (*logical.Response, error) {
 		roleName := data.Get("name").(string)
 		if roleName == "" {
 			return logical.ErrorResponse("missing role name"), nil
@@ -180,7 +191,7 @@ func (b *kubeAuthBackend) pathRoleCreateUpdate() framework.OperationFunc {
 		defer b.l.Unlock()
 
 		// Check if the role already exists
-		role, err := b.role(req.Storage, roleName)
+		role, err := b.role(ctx, req.Storage, roleName)
 		if err != nil {
 			return nil, err
 		}
@@ -273,6 +284,13 @@ func (b *kubeAuthBackend) pathRoleCreateUpdate() framework.OperationFunc {
 			return logical.ErrorResponse("service_account_names and service_account_namespaces can not both be \"*\""), nil
 		}
 
+		// Parse bound CIDRs.
+		boundCIDRs, err := parseutil.ParseAddrs(data.Get("bound_cidrs"))
+		if err != nil {
+			return logical.ErrorResponse("unable to parse bound_cidrs: " + err.Error()), nil
+		}
+		role.BoundCIDRs = boundCIDRs
+
 		// Store the entry.
 		entry, err := logical.StorageEntryJSON("role/"+strings.ToLower(roleName), role)
 		if err != nil {
@@ -281,7 +299,7 @@ func (b *kubeAuthBackend) pathRoleCreateUpdate() framework.OperationFunc {
 		if entry == nil {
 			return nil, fmt.Errorf("failed to create storage entry for role %s", roleName)
 		}
-		if err = req.Storage.Put(entry); err != nil {
+		if err = req.Storage.Put(ctx, entry); err != nil {
 			return nil, err
 		}
 
@@ -317,6 +335,8 @@ type roleStorageEntry struct {
 	// ServiceAccountNamespaces is the array of namespaces able to access this
 	// role.
 	ServiceAccountNamespaces []string `json:"bound_service_account_namespaces" mapstructure:"bound_service_account_namespaces" structs:"bound_service_account_namespaces"`
+
+	BoundCIDRs []*sockaddr.SockAddrMarshaler
 }
 
 var roleHelp = map[string][2]string{

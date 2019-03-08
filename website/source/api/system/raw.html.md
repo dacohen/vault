@@ -1,16 +1,17 @@
 ---
 layout: "api"
 page_title: "/sys/raw - HTTP API"
-sidebar_current: "docs-http-system-raw"
+sidebar_title: "<code>/sys/raw</code>"
+sidebar_current: "api-http-system-raw"
 description: |-
-  The `/sys/raw` endpoint is access the raw underlying store in Vault.
+  The `/sys/raw` endpoint is used to access the raw underlying store in Vault.
 ---
 
 # `/sys/raw`
 
-The `/sys/raw` endpoint is access the raw underlying store in Vault.
+The `/sys/raw` endpoint is used to access the raw underlying store in Vault.
 
-This endpont is off by default.  See the 
+This endpoint is off by default.  See the 
 [Vault configuration documentation](/docs/configuration/index.html) to
 enable.
 
@@ -34,7 +35,7 @@ system.
 ```
 $ curl \
     ---header "X-Vault-Token: ..." \
-    https://vault.rocks/v1/sys/raw/secret/foo
+    http://127.0.0.1:8200/v1/sys/raw/secret/foo
 ```
 
 ### Sample Response
@@ -77,7 +78,7 @@ $ curl \
     --header "X-Vault-Token: ..." \
     --request PUT \
     --data @payload.json \
-    https://vault.rocks/v1/sys/raw/secret/foo
+    http://127.0.0.1:8200/v1/sys/raw/secret/foo
 ```
 
 ## List Raw
@@ -98,7 +99,7 @@ This endpoint returns a list keys for a given path prefix.
 $ curl \
     --header "X-Vault-Token: ..." \
     --request LIST \
-    https://vault.rocks/v1/sys/raw/logical
+    http://127.0.0.1:8200/v1/sys/raw/logical
 ```
 
 ### Sample Response
@@ -135,5 +136,5 @@ storage backend and not the logical path that is exposed via the mount system.
 $ curl \
     --header "X-Vault-Token: ..." \
     --request DELETE \
-    https://vault.rocks/v1/sys/raw/secret/foo
+    http://127.0.0.1:8200/v1/sys/raw/secret/foo
 ```

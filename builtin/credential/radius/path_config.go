@@ -1,9 +1,9 @@
 package radius
 
 import (
+	"context"
 	"strings"
 
-	"github.com/fatih/structs"
 	"github.com/hashicorp/vault/logical"
 	"github.com/hashicorp/vault/logical/framework"
 )
@@ -15,6 +15,7 @@ func pathConfig(b *backend) *framework.Path {
 			"host": &framework.FieldSchema{
 				Type:        framework.TypeString,
 				Description: "RADIUS server host",
+				DisplayName: "Host",
 			},
 
 			"port": &framework.FieldSchema{
@@ -30,6 +31,7 @@ func pathConfig(b *backend) *framework.Path {
 				Type:        framework.TypeString,
 				Default:     "",
 				Description: "Comma-separated list of policies to grant upon successful RADIUS authentication of an unregisted user (default: emtpy)",
+				DisplayName: "Policies for unregistered users",
 			},
 			"dial_timeout": &framework.FieldSchema{
 				Type:        framework.TypeDurationSecond,
@@ -39,12 +41,19 @@ func pathConfig(b *backend) *framework.Path {
 			"read_timeout": &framework.FieldSchema{
 				Type:        framework.TypeDurationSecond,
 				Default:     10,
-				Description: "Number of seconds before response times out (default: 10). Note: kept for backwards compatibility, currently unused.",
+				Description: "Number of seconds before response times out (default: 10)",
 			},
 			"nas_port": &framework.FieldSchema{
 				Type:        framework.TypeInt,
 				Default:     10,
 				Description: "RADIUS NAS port field (default: 10)",
+				DisplayName: "NAS Port",
+			},
+			"nas_identifier": &framework.FieldSchema{
+				Type:        framework.TypeString,
+				Default:     "",
+				Description: "RADIUS NAS Identifier field (optional)",
+				DisplayName: "NAS Identifier",
 			},
 		},
 
@@ -63,8 +72,8 @@ func pathConfig(b *backend) *framework.Path {
 
 // Establishes dichotomy of request operation between CreateOperation and UpdateOperation.
 // Returning 'true' forces an UpdateOperation, CreateOperation otherwise.
-func (b *backend) configExistenceCheck(req *logical.Request, data *framework.FieldData) (bool, error) {
-	entry, err := b.Config(req)
+func (b *backend) configExistenceCheck(ctx context.Context, req *logical.Request, data *framework.FieldData) (bool, error) {
+	entry, err := b.Config(ctx, req)
 	if err != nil {
 		return false, err
 	}
@@ -74,9 +83,8 @@ func (b *backend) configExistenceCheck(req *logical.Request, data *framework.Fie
 /*
  * Construct ConfigEntry struct using stored configuration.
  */
-func (b *backend) Config(req *logical.Request) (*ConfigEntry, error) {
-
-	storedConfig, err := req.Storage.Get("config")
+func (b *backend) Config(ctx context.Context, req *logical.Request) (*ConfigEntry, error) {
+	storedConfig, err := req.Storage.Get(ctx, "config")
 	if err != nil {
 		return nil, err
 	}
@@ -94,10 +102,8 @@ func (b *backend) Config(req *logical.Request) (*ConfigEntry, error) {
 	return &result, nil
 }
 
-func (b *backend) pathConfigRead(
-	req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
-
-	cfg, err := b.Config(req)
+func (b *backend) pathConfigRead(ctx context.Context, req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
+	cfg, err := b.Config(ctx, req)
 	if err != nil {
 		return nil, err
 	}
@@ -106,17 +112,22 @@ func (b *backend) pathConfigRead(
 	}
 
 	resp := &logical.Response{
-		Data: structs.New(cfg).Map(),
+		Data: map[string]interface{}{
+			"host":                       cfg.Host,
+			"port":                       cfg.Port,
+			"unregistered_user_policies": cfg.UnregisteredUserPolicies,
+			"dial_timeout":               cfg.DialTimeout,
+			"read_timeout":               cfg.ReadTimeout,
+			"nas_port":                   cfg.NasPort,
+			"nas_identifier":             cfg.NasIdentifier,
+		},
 	}
-	resp.AddWarning("Read access to this endpoint should be controlled via ACLs as it will return the configuration information as-is, including any secrets.")
 	return resp, nil
 }
 
-func (b *backend) pathConfigCreateUpdate(
-	req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
-
+func (b *backend) pathConfigCreateUpdate(ctx context.Context, req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
 	// Build a ConfigEntry struct out of the supplied FieldData
-	cfg, err := b.Config(req)
+	cfg, err := b.Config(ctx, req)
 	if err != nil {
 		return nil, err
 	}
@@ -159,7 +170,7 @@ func (b *backend) pathConfigCreateUpdate(
 			policies = strings.Split(unregisteredUserPoliciesStr, ",")
 			for _, policy := range policies {
 				if policy == "root" {
-					return logical.ErrorResponse("root policy cannot be granted by an authentication backend"), nil
+					return logical.ErrorResponse("root policy cannot be granted by an auth method"), nil
 				}
 			}
 		}
@@ -189,11 +200,18 @@ func (b *backend) pathConfigCreateUpdate(
 		cfg.NasPort = d.Get("nas_port").(int)
 	}
 
+	nasIdentifier, ok := d.GetOk("nas_identifier")
+	if ok {
+		cfg.NasIdentifier = nasIdentifier.(string)
+	} else if req.Operation == logical.CreateOperation {
+		cfg.NasIdentifier = d.Get("nas_identifier").(string)
+	}
+
 	entry, err := logical.StorageEntryJSON("config", cfg)
 	if err != nil {
 		return nil, err
 	}
-	if err := req.Storage.Put(entry); err != nil {
+	if err := req.Storage.Put(ctx, entry); err != nil {
 		return nil, err
 	}
 
@@ -208,6 +226,7 @@ type ConfigEntry struct {
 	DialTimeout              int      `json:"dial_timeout" structs:"dial_timeout" mapstructure:"dial_timeout"`
 	ReadTimeout              int      `json:"read_timeout" structs:"read_timeout" mapstructure:"read_timeout"`
 	NasPort                  int      `json:"nas_port" structs:"nas_port" mapstructure:"nas_port"`
+	NasIdentifier            string   `json:"nas_identifier" structs:"nas_identifier" mapstructure:"nas_identifier"`
 }
 
 const pathConfigHelpSyn = `

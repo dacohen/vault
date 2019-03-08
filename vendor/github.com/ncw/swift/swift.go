@@ -297,6 +297,7 @@ var (
 	TimeoutError        = newError(408, "Timeout when reading or writing data")
 	Forbidden           = newError(403, "Operation forbidden")
 	TooLargeObject      = newError(413, "Too Large Object")
+	RateLimit           = newError(498, "Rate Limit")
 
 	// Mappings for authentication errors
 	authErrorMap = errorMap{
@@ -311,6 +312,7 @@ var (
 		403: Forbidden,
 		404: ContainerNotFound,
 		409: ContainerNotEmpty,
+		498: RateLimit,
 	}
 
 	// Mappings for object errors
@@ -321,6 +323,7 @@ var (
 		404: ObjectNotFound,
 		413: TooLargeObject,
 		422: ObjectCorrupted,
+		498: RateLimit,
 	}
 )
 
@@ -471,6 +474,7 @@ again:
 	}
 	if req != nil {
 		timer := time.NewTimer(c.ConnectTimeout)
+		defer timer.Stop()
 		var resp *http.Response
 		resp, err = c.doTimeoutRequest(timer, req)
 		if err != nil {
@@ -691,6 +695,7 @@ func (c *Connection) Call(targetUrl string, p RequestOpts) (resp *http.Response,
 			URL.RawQuery = p.Parameters.Encode()
 		}
 		timer := time.NewTimer(c.ConnectTimeout)
+		defer timer.Stop()
 		reader := p.Body
 		if reader != nil {
 			reader = newWatchdogReader(reader, c.Timeout, timer)
@@ -1008,7 +1013,8 @@ type Object struct {
 	Bytes              int64      `json:"bytes"`         // size in bytes
 	ServerLastModified string     `json:"last_modified"` // Last modified time, eg '2011-06-30T08:20:47.736680' as a string supplied by the server
 	LastModified       time.Time  // Last modified time converted to a time.Time
-	Hash               string     `json:"hash"` // MD5 hash, eg "d41d8cd98f00b204e9800998ecf8427e"
+	Hash               string     `json:"hash"`     // MD5 hash, eg "d41d8cd98f00b204e9800998ecf8427e"
+	SLOHash            string     `json:"slo_etag"` // MD5 hash of all segments' MD5 hash, eg "d41d8cd98f00b204e9800998ecf8427e"
 	PseudoDirectory    bool       // Set when using delimiter to show that this directory object does not really exist
 	SubDir             string     `json:"subdir"` // returned only when using delimiter to mark "pseudo directories"
 	ObjectType         ObjectType // type of this object
@@ -1059,6 +1065,9 @@ func (c *Connection) Objects(container string, opts *ObjectsOpts) ([]Object, err
 			if err != nil {
 				return nil, err
 			}
+		}
+		if object.SLOHash != "" {
+			object.ObjectType = StaticLargeObjectType
 		}
 	}
 	return objects, err
@@ -1838,14 +1847,16 @@ type BulkDeleteResult struct {
 func (c *Connection) doBulkDelete(objects []string) (result BulkDeleteResult, err error) {
 	var buffer bytes.Buffer
 	for _, s := range objects {
-		buffer.WriteString(url.QueryEscape(s) + "\n")
+		u := url.URL{Path: s}
+		buffer.WriteString(u.String() + "\n")
 	}
 	resp, headers, err := c.storage(RequestOpts{
 		Operation:  "DELETE",
 		Parameters: url.Values{"bulk-delete": []string{"1"}},
 		Headers: Headers{
-			"Accept":       "application/json",
-			"Content-Type": "text/plain",
+			"Accept":         "application/json",
+			"Content-Type":   "text/plain",
+			"Content-Length": strconv.Itoa(buffer.Len()),
 		},
 		ErrorMap: ContainerErrorMap,
 		Body:     &buffer,
@@ -1888,6 +1899,10 @@ func (c *Connection) doBulkDelete(objects []string) (result BulkDeleteResult, er
 // * http://docs.openstack.org/trunk/openstack-object-storage/admin/content/object-storage-bulk-delete.html
 // * http://docs.rackspace.com/files/api/v1/cf-devguide/content/Bulk_Delete-d1e2338.html
 func (c *Connection) BulkDelete(container string, objectNames []string) (result BulkDeleteResult, err error) {
+	if len(objectNames) == 0 {
+		result.Errors = make(map[string]error)
+		return
+	}
 	fullPaths := make([]string, len(objectNames))
 	for i, name := range objectNames {
 		fullPaths[i] = fmt.Sprintf("/%s/%s", container, name)
@@ -2072,6 +2087,15 @@ func (c *Connection) ObjectUpdate(container string, objectName string, h Headers
 	return err
 }
 
+// urlPathEscape escapes URL path the in string using URL escaping rules
+//
+// This mimics url.PathEscape which only available from go 1.8
+func urlPathEscape(in string) string {
+	var u url.URL
+	u.Path = in
+	return u.String()
+}
+
 // ObjectCopy does a server side copy of an object to a new position
 //
 // All metadata is preserved.  If metadata is set in the headers then
@@ -2084,7 +2108,7 @@ func (c *Connection) ObjectUpdate(container string, objectName string, h Headers
 func (c *Connection) ObjectCopy(srcContainer string, srcObjectName string, dstContainer string, dstObjectName string, h Headers) (headers Headers, err error) {
 	// Meta stuff
 	extraHeaders := map[string]string{
-		"Destination": dstContainer + "/" + dstObjectName,
+		"Destination": urlPathEscape(dstContainer + "/" + dstObjectName),
 	}
 	for key, value := range h {
 		extraHeaders[key] = value

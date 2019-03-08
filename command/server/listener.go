@@ -1,6 +1,7 @@
 package server
 
 import (
+	"github.com/hashicorp/errwrap"
 	// We must import sha512 so that it registers with the runtime so that
 	// certificates that use it can be parsed.
 	_ "crypto/sha512"
@@ -15,10 +16,12 @@ import (
 	"github.com/hashicorp/vault/helper/proxyutil"
 	"github.com/hashicorp/vault/helper/reload"
 	"github.com/hashicorp/vault/helper/tlsutil"
+	"github.com/jefferai/isbadcipher"
+	"github.com/mitchellh/cli"
 )
 
 // ListenerFactory is the factory function to create a listener.
-type ListenerFactory func(map[string]interface{}, io.Writer) (net.Listener, map[string]string, reload.ReloadFunc, error)
+type ListenerFactory func(map[string]interface{}, io.Writer, cli.Ui) (net.Listener, map[string]string, reload.ReloadFunc, error)
 
 // BuiltinListeners is the list of built-in listener types.
 var BuiltinListeners = map[string]ListenerFactory{
@@ -27,13 +30,13 @@ var BuiltinListeners = map[string]ListenerFactory{
 
 // NewListener creates a new listener of the given type with the given
 // configuration. The type is looked up in the BuiltinListeners map.
-func NewListener(t string, config map[string]interface{}, logger io.Writer) (net.Listener, map[string]string, reload.ReloadFunc, error) {
+func NewListener(t string, config map[string]interface{}, logger io.Writer, ui cli.Ui) (net.Listener, map[string]string, reload.ReloadFunc, error) {
 	f, ok := BuiltinListeners[t]
 	if !ok {
-		return nil, nil, nil, fmt.Errorf("unknown listener type: %s", t)
+		return nil, nil, nil, fmt.Errorf("unknown listener type: %q", t)
 	}
 
-	return f(config, logger)
+	return f(config, logger, ui)
 }
 
 func listenerWrapProxy(ln net.Listener, config map[string]interface{}) (net.Listener, error) {
@@ -47,58 +50,75 @@ func listenerWrapProxy(ln net.Listener, config map[string]interface{}) (net.List
 		return nil, fmt.Errorf("failed parsing proxy_protocol_behavior value: not a string")
 	}
 
-	authorizedAddrsRaw, ok := config["proxy_protocol_authorized_addrs"]
-	if !ok {
-		return nil, fmt.Errorf("proxy_protocol_behavior set but no proxy_protocol_authorized_addrs value")
-	}
-
 	proxyProtoConfig := &proxyutil.ProxyProtoConfig{
 		Behavior: behavior,
 	}
-	if err := proxyProtoConfig.SetAuthorizedAddrs(authorizedAddrsRaw); err != nil {
-		return nil, fmt.Errorf("failed parsing proxy_protocol_authorized_addrs: %v", err)
+
+	if proxyProtoConfig.Behavior == "allow_authorized" || proxyProtoConfig.Behavior == "deny_unauthorized" {
+		authorizedAddrsRaw, ok := config["proxy_protocol_authorized_addrs"]
+		if !ok {
+			return nil, fmt.Errorf("proxy_protocol_behavior set but no proxy_protocol_authorized_addrs value")
+		}
+
+		if err := proxyProtoConfig.SetAuthorizedAddrs(authorizedAddrsRaw); err != nil {
+			return nil, errwrap.Wrapf("failed parsing proxy_protocol_authorized_addrs: {{err}}", err)
+		}
 	}
 
 	newLn, err := proxyutil.WrapInProxyProto(ln, proxyProtoConfig)
 	if err != nil {
-		return nil, fmt.Errorf("failed configuring PROXY protocol wrapper: %s", err)
+		return nil, errwrap.Wrapf("failed configuring PROXY protocol wrapper: {{err}}", err)
 	}
 
 	return newLn, nil
 }
 
-func listenerWrapTLS(
+func ListenerWrapTLS(
 	ln net.Listener,
 	props map[string]string,
-	config map[string]interface{}) (net.Listener, map[string]string, reload.ReloadFunc, error) {
+	config map[string]interface{},
+	ui cli.Ui) (net.Listener, map[string]string, reload.ReloadFunc, error) {
 	props["tls"] = "disabled"
 
 	if v, ok := config["tls_disable"]; ok {
 		disabled, err := parseutil.ParseBool(v)
 		if err != nil {
-			return nil, nil, nil, fmt.Errorf("invalid value for 'tls_disable': %v", err)
+			return nil, nil, nil, errwrap.Wrapf("invalid value for 'tls_disable': {{err}}", err)
 		}
 		if disabled {
 			return ln, props, nil, nil
 		}
 	}
 
-	_, ok := config["tls_cert_file"]
+	certFileRaw, ok := config["tls_cert_file"]
 	if !ok {
 		return nil, nil, nil, fmt.Errorf("'tls_cert_file' must be set")
 	}
-
-	_, ok = config["tls_key_file"]
+	certFile := certFileRaw.(string)
+	keyFileRaw, ok := config["tls_key_file"]
 	if !ok {
 		return nil, nil, nil, fmt.Errorf("'tls_key_file' must be set")
 	}
+	keyFile := keyFileRaw.(string)
 
-	cg := reload.NewCertificateGetter(config["tls_cert_file"].(string), config["tls_key_file"].(string))
-
+	cg := reload.NewCertificateGetter(certFile, keyFile, "")
 	if err := cg.Reload(config); err != nil {
-		return nil, nil, nil, fmt.Errorf("error loading TLS cert: %s", err)
+		// We try the key without a passphrase first and if we get an incorrect
+		// passphrase response, try again after prompting for a passphrase
+		if errwrap.Contains(err, x509.IncorrectPasswordError.Error()) {
+			var passphrase string
+			passphrase, err = ui.AskSecret(fmt.Sprintf("Enter passphrase for %s:", keyFile))
+			if err == nil {
+				cg = reload.NewCertificateGetter(certFile, keyFile, passphrase)
+				if err = cg.Reload(config); err == nil {
+					goto PASSPHRASECORRECT
+				}
+			}
+		}
+		return nil, nil, nil, errwrap.Wrapf("error loading TLS cert: {{err}}", err)
 	}
 
+PASSPHRASECORRECT:
 	var tlsvers string
 	tlsversRaw, ok := config["tls_min_version"]
 	if !ok {
@@ -112,21 +132,49 @@ func listenerWrapTLS(
 	tlsConf.NextProtos = []string{"h2", "http/1.1"}
 	tlsConf.MinVersion, ok = tlsutil.TLSLookup[tlsvers]
 	if !ok {
-		return nil, nil, nil, fmt.Errorf("'tls_min_version' value %s not supported, please specify one of [tls10,tls11,tls12]", tlsvers)
+		return nil, nil, nil, fmt.Errorf("'tls_min_version' value %q not supported, please specify one of [tls10,tls11,tls12]", tlsvers)
 	}
 	tlsConf.ClientAuth = tls.RequestClientCert
 
 	if v, ok := config["tls_cipher_suites"]; ok {
 		ciphers, err := tlsutil.ParseCiphers(v.(string))
 		if err != nil {
-			return nil, nil, nil, fmt.Errorf("invalid value for 'tls_cipher_suites': %v", err)
+			return nil, nil, nil, errwrap.Wrapf("invalid value for 'tls_cipher_suites': {{err}}", err)
+		}
+
+		// HTTP/2 with TLS 1.2 blacklists several cipher suites.
+		// https://tools.ietf.org/html/rfc7540#appendix-A
+		//
+		// Since the CLI (net/http) automatically uses HTTP/2 with TLS 1.2,
+		// we check here if all or some specified cipher suites are blacklisted.
+		badCiphers := []string{}
+		for _, cipher := range ciphers {
+			if isbadcipher.IsBadCipher(cipher) {
+				// Get the name of the current cipher.
+				cipherStr, err := tlsutil.GetCipherName(cipher)
+				if err != nil {
+					return nil, nil, nil, errwrap.Wrapf("invalid value for 'tls_cipher_suites': {{err}}", err)
+				}
+				badCiphers = append(badCiphers, cipherStr)
+			}
+		}
+		if len(badCiphers) == len(ciphers) {
+			ui.Warn(`WARNING! All cipher suites defined by 'tls_cipher_suites' are blacklisted by the
+HTTP/2 specification. HTTP/2 communication with TLS 1.2 will not work as intended
+and Vault will be unavailable via the CLI.
+Please see https://tools.ietf.org/html/rfc7540#appendix-A for further information.`)
+		} else if len(badCiphers) > 0 {
+			ui.Warn(fmt.Sprintf(`WARNING! The following cipher suites defined by 'tls_cipher_suites' are 
+blacklisted by the HTTP/2 specification: 
+%v
+Please see https://tools.ietf.org/html/rfc7540#appendix-A for further information.`, badCiphers))
 		}
 		tlsConf.CipherSuites = ciphers
 	}
 	if v, ok := config["tls_prefer_server_cipher_suites"]; ok {
 		preferServer, err := parseutil.ParseBool(v)
 		if err != nil {
-			return nil, nil, nil, fmt.Errorf("invalid value for 'tls_prefer_server_cipher_suites': %v", err)
+			return nil, nil, nil, errwrap.Wrapf("invalid value for 'tls_prefer_server_cipher_suites': {{err}}", err)
 		}
 		tlsConf.PreferServerCipherSuites = preferServer
 	}
@@ -135,7 +183,7 @@ func listenerWrapTLS(
 	if v, ok := config["tls_require_and_verify_client_cert"]; ok {
 		requireVerifyCerts, err = parseutil.ParseBool(v)
 		if err != nil {
-			return nil, nil, nil, fmt.Errorf("invalid value for 'tls_require_and_verify_client_cert': %v", err)
+			return nil, nil, nil, errwrap.Wrapf("invalid value for 'tls_require_and_verify_client_cert': {{err}}", err)
 		}
 		if requireVerifyCerts {
 			tlsConf.ClientAuth = tls.RequireAndVerifyClientCert
@@ -144,7 +192,7 @@ func listenerWrapTLS(
 			caPool := x509.NewCertPool()
 			data, err := ioutil.ReadFile(tlsClientCaFile.(string))
 			if err != nil {
-				return nil, nil, nil, fmt.Errorf("failed to read tls_client_ca_file: %v", err)
+				return nil, nil, nil, errwrap.Wrapf("failed to read tls_client_ca_file: {{err}}", err)
 			}
 
 			if !caPool.AppendCertsFromPEM(data) {
@@ -156,12 +204,14 @@ func listenerWrapTLS(
 	if v, ok := config["tls_disable_client_certs"]; ok {
 		disableClientCerts, err := parseutil.ParseBool(v)
 		if err != nil {
-			return nil, nil, nil, fmt.Errorf("invalid value for 'tls_disable_client_certs': %v", err)
+			return nil, nil, nil, errwrap.Wrapf("invalid value for 'tls_disable_client_certs': {{err}}", err)
 		}
 		if disableClientCerts && requireVerifyCerts {
 			return nil, nil, nil, fmt.Errorf("'tls_disable_client_certs' and 'tls_require_and_verify_client_cert' are mutually exclusive")
 		}
-		tlsConf.ClientAuth = tls.NoClientCert
+		if disableClientCerts {
+			tlsConf.ClientAuth = tls.NoClientCert
+		}
 	}
 
 	ln = tls.NewListener(ln, tlsConf)

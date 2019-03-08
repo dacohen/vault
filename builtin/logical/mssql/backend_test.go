@@ -1,12 +1,14 @@
 package mssql
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"os"
 	"reflect"
 	"testing"
 
+	_ "github.com/denisenkom/go-mssqldb"
 	"github.com/hashicorp/vault/logical"
 	logicaltest "github.com/hashicorp/vault/logical/testing"
 	"github.com/mitchellh/mapstructure"
@@ -17,7 +19,7 @@ func TestBackend_config_connection(t *testing.T) {
 	var err error
 	config := logical.TestBackendConfig()
 	config.StorageView = &logical.InmemStorage{}
-	b, err := Factory(config)
+	b, err := Factory(context.Background(), config)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -34,32 +36,38 @@ func TestBackend_config_connection(t *testing.T) {
 		Storage:   config.StorageView,
 		Data:      configData,
 	}
-	resp, err = b.HandleRequest(configReq)
+	resp, err = b.HandleRequest(context.Background(), configReq)
 	if err != nil || (resp != nil && resp.IsError()) {
 		t.Fatalf("err:%s resp:%#v\n", err, resp)
 	}
 
 	configReq.Operation = logical.ReadOperation
-	resp, err = b.HandleRequest(configReq)
+	resp, err = b.HandleRequest(context.Background(), configReq)
 	if err != nil || (resp != nil && resp.IsError()) {
 		t.Fatalf("err:%s resp:%#v\n", err, resp)
 	}
 
 	delete(configData, "verify_connection")
+	delete(configData, "connection_string")
 	if !reflect.DeepEqual(configData, resp.Data) {
 		t.Fatalf("bad: expected:%#v\nactual:%#v\n", configData, resp.Data)
 	}
 }
 
 func TestBackend_basic(t *testing.T) {
-	b, _ := Factory(logical.TestBackendConfig())
+	if os.Getenv(logicaltest.TestEnvVar) == "" || os.Getenv("MSSQL_URL") == "" {
+		t.Skip(fmt.Sprintf("Acceptance tests skipped unless env '%s' set", logicaltest.TestEnvVar))
+	}
+	connURL := os.Getenv("MSSQL_URL")
+
+	b, _ := Factory(context.Background(), logical.TestBackendConfig())
 
 	logicaltest.Test(t, logicaltest.TestCase{
 		AcceptanceTest: true,
-		PreCheck:       func() { testAccPreCheck(t) },
-		Backend:        b,
+		PreCheck:       testAccPreCheckFunc(t, connURL),
+		LogicalBackend: b,
 		Steps: []logicaltest.TestStep{
-			testAccStepConfig(t),
+			testAccStepConfig(t, connURL),
 			testAccStepRole(t),
 			testAccStepReadCreds(t, "web"),
 		},
@@ -67,14 +75,19 @@ func TestBackend_basic(t *testing.T) {
 }
 
 func TestBackend_roleCrud(t *testing.T) {
+	if os.Getenv(logicaltest.TestEnvVar) == "" || os.Getenv("MSSQL_URL") == "" {
+		t.Skip(fmt.Sprintf("Acceptance tests skipped unless env '%s' set", logicaltest.TestEnvVar))
+	}
+	connURL := os.Getenv("MSSQL_URL")
+
 	b := Backend()
 
 	logicaltest.Test(t, logicaltest.TestCase{
 		AcceptanceTest: true,
-		PreCheck:       func() { testAccPreCheck(t) },
-		Backend:        b,
+		PreCheck:       testAccPreCheckFunc(t, connURL),
+		LogicalBackend: b,
 		Steps: []logicaltest.TestStep{
-			testAccStepConfig(t),
+			testAccStepConfig(t, connURL),
 			testAccStepRole(t),
 			testAccStepReadRole(t, "web", testRoleSQL),
 			testAccStepDeleteRole(t, "web"),
@@ -84,14 +97,19 @@ func TestBackend_roleCrud(t *testing.T) {
 }
 
 func TestBackend_leaseWriteRead(t *testing.T) {
+	if os.Getenv(logicaltest.TestEnvVar) == "" || os.Getenv("MSSQL_URL") == "" {
+		t.Skip(fmt.Sprintf("Acceptance tests skipped unless env '%s' set", logicaltest.TestEnvVar))
+	}
+	connURL := os.Getenv("MSSQL_URL")
+
 	b := Backend()
 
 	logicaltest.Test(t, logicaltest.TestCase{
 		AcceptanceTest: true,
-		PreCheck:       func() { testAccPreCheck(t) },
-		Backend:        b,
+		PreCheck:       testAccPreCheckFunc(t, connURL),
+		LogicalBackend: b,
 		Steps: []logicaltest.TestStep{
-			testAccStepConfig(t),
+			testAccStepConfig(t, connURL),
 			testAccStepWriteLease(t),
 			testAccStepReadLease(t),
 		},
@@ -99,18 +117,20 @@ func TestBackend_leaseWriteRead(t *testing.T) {
 
 }
 
-func testAccPreCheck(t *testing.T) {
-	if v := os.Getenv("MSSQL_DSN"); v == "" {
-		t.Fatal("MSSQL_DSN must be set for acceptance tests")
+func testAccPreCheckFunc(t *testing.T, connectionURL string) func() {
+	return func() {
+		if connectionURL == "" {
+			t.Fatal("connection URL must be set for acceptance tests")
+		}
 	}
 }
 
-func testAccStepConfig(t *testing.T) logicaltest.TestStep {
+func testAccStepConfig(t *testing.T, connURL string) logicaltest.TestStep {
 	return logicaltest.TestStep{
 		Operation: logical.UpdateOperation,
 		Path:      "config/connection",
 		Data: map[string]interface{}{
-			"connection_string": os.Getenv("MSSQL_DSN"),
+			"connection_string": connURL,
 		},
 	}
 }

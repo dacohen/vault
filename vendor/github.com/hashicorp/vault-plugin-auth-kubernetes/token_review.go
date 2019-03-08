@@ -12,11 +12,11 @@ import (
 	"strings"
 
 	cleanhttp "github.com/hashicorp/go-cleanhttp"
+	authv1 "k8s.io/api/authentication/v1"
 	kubeerrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
-	authv1 "k8s.io/client-go/pkg/apis/authentication/v1"
 )
 
 // This is the result from the token review
@@ -85,9 +85,14 @@ func (t *tokenReviewAPI) Review(jwt string) (*tokenReviewResult, error) {
 	if len(t.config.TokenReviewerJWT) > 0 {
 		bearer = fmt.Sprintf("Bearer %s", t.config.TokenReviewerJWT)
 	}
+	bearer = strings.TrimSpace(bearer)
 
 	// Set the JWT as the Bearer token
 	req.Header.Set("Authorization", bearer)
+
+	// Set the MIME type headers
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
 
 	resp, err := client.Do(req)
 	if err != nil {

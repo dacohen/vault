@@ -1,90 +1,96 @@
 package vault
 
 import (
+	"context"
 	"fmt"
 	"strings"
 
 	"github.com/golang/protobuf/ptypes"
-	memdb "github.com/hashicorp/go-memdb"
 	"github.com/hashicorp/vault/helper/identity"
+	"github.com/hashicorp/vault/helper/namespace"
+	"github.com/hashicorp/vault/helper/storagepacker"
 	"github.com/hashicorp/vault/logical"
 	"github.com/hashicorp/vault/logical/framework"
 )
 
 // aliasPaths returns the API endpoints to operate on aliases.
 // Following are the paths supported:
-// alias - To register/modify a alias
-// alias/id - To lookup, delete and list aliases based on ID
+// entity-alias - To register/modify an alias
+// entity-alias/id - To read, modify, delete and list aliases based on their ID
 func aliasPaths(i *IdentityStore) []*framework.Path {
 	return []*framework.Path{
 		{
-			Pattern: "alias$",
+			Pattern: "entity-alias$",
 			Fields: map[string]*framework.FieldSchema{
 				"id": {
 					Type:        framework.TypeString,
-					Description: "ID of the alias",
+					Description: "ID of the entity alias. If set, updates the corresponding entity alias.",
 				},
+				// entity_id is deprecated in favor of canonical_id
 				"entity_id": {
+					Type: framework.TypeString,
+					Description: `Entity ID to which this alias belongs.
+This field is deprecated, use canonical_id.`,
+				},
+				"canonical_id": {
 					Type:        framework.TypeString,
-					Description: "Entity ID to which this alias belongs to",
+					Description: "Entity ID to which this alias belongs",
 				},
 				"mount_accessor": {
 					Type:        framework.TypeString,
-					Description: "Mount accessor to which this alias belongs to",
+					Description: "Mount accessor to which this alias belongs to; unused for a modify",
 				},
 				"name": {
 					Type:        framework.TypeString,
-					Description: "Name of the alias",
-				},
-				"metadata": {
-					Type:        framework.TypeStringSlice,
-					Description: "Metadata to be associated with the alias. Format should be a list of `key=value` pairs.",
+					Description: "Name of the alias; unused for a modify",
 				},
 			},
 			Callbacks: map[logical.Operation]framework.OperationFunc{
-				logical.UpdateOperation: i.pathAliasRegister,
+				logical.UpdateOperation: i.handleAliasUpdateCommon(),
 			},
 
 			HelpSynopsis:    strings.TrimSpace(aliasHelp["alias"][0]),
 			HelpDescription: strings.TrimSpace(aliasHelp["alias"][1]),
 		},
 		{
-			Pattern: "alias/id/" + framework.GenericNameRegex("id"),
+			Pattern: "entity-alias/id/" + framework.GenericNameRegex("id"),
 			Fields: map[string]*framework.FieldSchema{
 				"id": {
 					Type:        framework.TypeString,
 					Description: "ID of the alias",
 				},
+				// entity_id is deprecated
 				"entity_id": {
+					Type: framework.TypeString,
+					Description: `Entity ID to which this alias belongs to.
+This field is deprecated, use canonical_id.`,
+				},
+				"canonical_id": {
 					Type:        framework.TypeString,
 					Description: "Entity ID to which this alias should be tied to",
 				},
 				"mount_accessor": {
 					Type:        framework.TypeString,
-					Description: "Mount accessor to which this alias belongs to",
+					Description: "(Unused)",
 				},
 				"name": {
 					Type:        framework.TypeString,
-					Description: "Name of the alias",
-				},
-				"metadata": {
-					Type:        framework.TypeStringSlice,
-					Description: "Metadata to be associated with the alias. Format should be a comma separated list of `key=value` pairs.",
+					Description: "(Unused)",
 				},
 			},
 			Callbacks: map[logical.Operation]framework.OperationFunc{
-				logical.UpdateOperation: i.pathAliasIDUpdate,
-				logical.ReadOperation:   i.pathAliasIDRead,
-				logical.DeleteOperation: i.pathAliasIDDelete,
+				logical.UpdateOperation: i.handleAliasUpdateCommon(),
+				logical.ReadOperation:   i.pathAliasIDRead(),
+				logical.DeleteOperation: i.pathAliasIDDelete(),
 			},
 
 			HelpSynopsis:    strings.TrimSpace(aliasHelp["alias-id"][0]),
 			HelpDescription: strings.TrimSpace(aliasHelp["alias-id"][1]),
 		},
 		{
-			Pattern: "alias/id/?$",
+			Pattern: "entity-alias/id/?$",
 			Callbacks: map[logical.Operation]framework.OperationFunc{
-				logical.ListOperation: i.pathAliasIDList,
+				logical.ListOperation: i.pathAliasIDList(),
 			},
 
 			HelpSynopsis:    strings.TrimSpace(aliasHelp["alias-id-list"][0]),
@@ -93,220 +99,232 @@ func aliasPaths(i *IdentityStore) []*framework.Path {
 	}
 }
 
-// pathAliasRegister is used to register new alias
-func (i *IdentityStore) pathAliasRegister(req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
-	_, ok := d.GetOk("id")
-	if ok {
-		return i.pathAliasIDUpdate(req, d)
-	}
+// handleAliasUpdateCommon is used to update an alias
+func (i *IdentityStore) handleAliasUpdateCommon() framework.OperationFunc {
+	return func(ctx context.Context, req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
+		var err error
+		var alias *identity.Alias
+		var entity *identity.Entity
+		var previousEntity *identity.Entity
 
-	return i.handleAliasUpdateCommon(req, d, nil)
-}
+		i.lock.Lock()
+		defer i.lock.Unlock()
 
-// pathAliasIDUpdate is used to update a alias based on the given
-// alias ID
-func (i *IdentityStore) pathAliasIDUpdate(req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
-	// Get alias id
-	aliasID := d.Get("id").(string)
+		// Check for update or create
+		aliasID := d.Get("id").(string)
+		if aliasID != "" {
+			alias, err = i.MemDBAliasByID(aliasID, true, false)
+			if err != nil {
+				return nil, err
+			}
+			if alias == nil {
+				return logical.ErrorResponse("invalid alias id"), nil
+			}
+		} else {
+			alias = &identity.Alias{}
+		}
 
-	if aliasID == "" {
-		return logical.ErrorResponse("missing alias ID"), nil
-	}
+		// Get entity id
+		canonicalID := d.Get("canonical_id").(string)
+		if canonicalID == "" {
+			// For backwards compatibility
+			canonicalID = d.Get("entity_id").(string)
+		}
 
-	alias, err := i.memDBAliasByID(aliasID, true)
-	if err != nil {
-		return nil, err
-	}
-	if alias == nil {
-		return logical.ErrorResponse("invalid alias id"), nil
-	}
+		// Get alias name
+		if aliasName := d.Get("name").(string); aliasName == "" {
+			if alias.Name == "" {
+				return logical.ErrorResponse("missing alias name"), nil
+			}
+		} else {
+			alias.Name = aliasName
+		}
 
-	return i.handleAliasUpdateCommon(req, d, alias)
-}
+		// Get mount accessor
+		if mountAccessor := d.Get("mount_accessor").(string); mountAccessor == "" {
+			if alias.MountAccessor == "" {
+				return logical.ErrorResponse("missing mount_accessor"), nil
+			}
+		} else {
+			alias.MountAccessor = mountAccessor
+		}
 
-// handleAliasUpdateCommon is used to update a alias
-func (i *IdentityStore) handleAliasUpdateCommon(req *logical.Request, d *framework.FieldData, alias *identity.Alias) (*logical.Response, error) {
-	var err error
-	var newAlias bool
-	var entity *identity.Entity
-	var previousEntity *identity.Entity
+		mountValidationResp := i.core.router.validateMountByAccessor(alias.MountAccessor)
+		if mountValidationResp == nil {
+			return logical.ErrorResponse(fmt.Sprintf("invalid mount accessor %q", alias.MountAccessor)), nil
+		}
+		if mountValidationResp.MountLocal {
+			return logical.ErrorResponse(fmt.Sprintf("mount_accessor %q is of a local mount", alias.MountAccessor)), nil
+		}
 
-	// Alias will be nil when a new alias is being registered; create a
-	// new struct in that case.
-	if alias == nil {
-		alias = &identity.Alias{}
-		newAlias = true
-	}
-
-	// Get entity id
-	entityID := d.Get("entity_id").(string)
-	if entityID != "" {
-		entity, err = i.memDBEntityByID(entityID, true)
+		// Verify that the combination of alias name and mount is not
+		// already tied to a different alias
+		aliasByFactors, err := i.MemDBAliasByFactors(mountValidationResp.MountAccessor, alias.Name, false, false)
 		if err != nil {
 			return nil, err
 		}
-		if entity == nil {
-			return logical.ErrorResponse("invalid entity ID"), nil
-		}
-	}
-
-	// Get alias name
-	aliasName := d.Get("name").(string)
-	if aliasName == "" {
-		return logical.ErrorResponse("missing alias name"), nil
-	}
-
-	mountAccessor := d.Get("mount_accessor").(string)
-	if mountAccessor == "" {
-		return logical.ErrorResponse("missing mount_accessor"), nil
-	}
-
-	mountValidationResp := i.validateMountAccessorFunc(mountAccessor)
-	if mountValidationResp == nil {
-		return logical.ErrorResponse(fmt.Sprintf("invalid mount accessor %q", mountAccessor)), nil
-	}
-
-	// Get alias metadata
-
-	// Accept metadata in the form of map[string]string to be able to index on
-	// it
-	var aliasMetadata map[string]string
-	aliasMetadataRaw, ok := d.GetOk("metadata")
-	if ok {
-		aliasMetadata, err = parseMetadata(aliasMetadataRaw.([]string))
-		if err != nil {
-			return logical.ErrorResponse(fmt.Sprintf("failed to parse alias metadata: %v", err)), nil
-		}
-	}
-
-	aliasByFactors, err := i.memDBAliasByFactors(mountValidationResp.MountAccessor, aliasName, false)
-	if err != nil {
-		return nil, err
-	}
-
-	resp := &logical.Response{}
-
-	if newAlias {
 		if aliasByFactors != nil {
-			return logical.ErrorResponse("combination of mount and alias name is already in use"), nil
+			// If it's a create we won't have an alias ID so this will correctly
+			// bail. If it's an update alias will be the same as aliasbyfactors so
+			// we don't need to transfer any info over
+			if aliasByFactors.ID != alias.ID {
+				return logical.ErrorResponse("combination of mount and alias name is already in use"), nil
+			}
+
+			// Fetch the entity to which the alias is tied. We don't need to append
+			// here, so the only further checking is whether the canonical ID is
+			// different
+			entity, err = i.MemDBEntityByAliasID(alias.ID, true)
+			if err != nil {
+				return nil, err
+			}
+			if entity == nil {
+				return nil, fmt.Errorf("existing alias is not associated with an entity")
+			}
+		} else if alias.ID != "" {
+			// This is an update, not a create; if we have an associated entity
+			// already, load it
+			entity, err = i.MemDBEntityByAliasID(alias.ID, true)
+			if err != nil {
+				return nil, err
+			}
 		}
 
-		// If this is a alias being tied to a non-existent entity, create
-		// a new entity for it.
-		if entity == nil {
+		resp := &logical.Response{}
+
+		// If we found an existing alias we won't hit this condition because
+		// canonicalID being empty will result in nil being returned in the block
+		// above, so in this case we know that creating a new entity is the right
+		// thing.
+		if canonicalID == "" {
 			entity = &identity.Entity{
 				Aliases: []*identity.Alias{
 					alias,
 				},
 			}
 		} else {
-			entity.Aliases = append(entity.Aliases, alias)
-		}
-	} else {
-		// Verify that the combination of alias name and mount is not
-		// already tied to a different alias
-		if aliasByFactors != nil && aliasByFactors.ID != alias.ID {
-			return logical.ErrorResponse("combination of mount and alias name is already in use"), nil
+			// If we can look up by the given canonical ID, see if this is a
+			// transfer; otherwise if we found no previous entity but we find one
+			// here, use it.
+			canonicalEntity, err := i.MemDBEntityByID(canonicalID, true)
+			if err != nil {
+				return nil, err
+			}
+			if canonicalEntity == nil {
+				return logical.ErrorResponse("invalid canonical ID"), nil
+			}
+			if entity == nil {
+				// If entity is nil, we didn't find a previous alias from factors,
+				// so append to this entity
+				entity = canonicalEntity
+				entity.Aliases = append(entity.Aliases, alias)
+			} else if entity.ID != canonicalEntity.ID {
+				// In this case we found an entity from alias factors or given
+				// alias ID but it's not the same, so it's a migration
+				previousEntity = entity
+				entity = canonicalEntity
+
+				for aliasIndex, item := range previousEntity.Aliases {
+					if item.ID == alias.ID {
+						previousEntity.Aliases = append(previousEntity.Aliases[:aliasIndex], previousEntity.Aliases[aliasIndex+1:]...)
+						break
+					}
+				}
+
+				entity.Aliases = append(entity.Aliases, alias)
+				resp.AddWarning(fmt.Sprintf("alias is being transferred from entity %q to %q", previousEntity.ID, entity.ID))
+			}
 		}
 
-		// Fetch the entity to which the alias is tied to
-		existingEntity, err := i.memDBEntityByAliasID(alias.ID, true)
+		// ID creation and other validations; This is more useful for new entities
+		// and may not perform anything for the existing entities. Placing the
+		// check here to make the flow common for both new and existing entities.
+		err = i.sanitizeEntity(ctx, entity)
 		if err != nil {
 			return nil, err
 		}
 
-		if existingEntity == nil {
-			return nil, fmt.Errorf("alias is not associated with an entity")
+		// Explicitly set to empty as in the past we incorrectly saved it
+		alias.MountPath = ""
+		alias.MountType = ""
+
+		// Set the canonical ID in the alias index. This should be done after
+		// sanitizing entity.
+		alias.CanonicalID = entity.ID
+
+		// ID creation and other validations
+		err = i.sanitizeAlias(ctx, alias)
+		if err != nil {
+			return nil, err
 		}
 
-		if entity != nil && entity.ID != existingEntity.ID {
-			// Alias should be transferred from 'existingEntity' to 'entity'
-			err = i.deleteAliasFromEntity(existingEntity, alias)
-			if err != nil {
-				return nil, err
+		for index, item := range entity.Aliases {
+			if item.ID == alias.ID {
+				entity.Aliases[index] = alias
 			}
-			previousEntity = existingEntity
-			entity.Aliases = append(entity.Aliases, alias)
-			resp.AddWarning(fmt.Sprintf("alias is being transferred from entity %q to %q", existingEntity.ID, entity.ID))
-		} else {
-			// Update entity with modified alias
-			err = i.updateAliasInEntity(existingEntity, alias)
-			if err != nil {
-				return nil, err
-			}
-			entity = existingEntity
 		}
+
+		// Index entity and its aliases in MemDB and persist entity along with
+		// aliases in storage. If the alias is being transferred over from
+		// one entity to another, previous entity needs to get refreshed in MemDB
+		// and persisted in storage as well.
+		if err := i.upsertEntity(ctx, entity, previousEntity, true); err != nil {
+			return nil, err
+		}
+
+		// Return ID of both alias and entity
+		resp.Data = map[string]interface{}{
+			"id":           alias.ID,
+			"canonical_id": entity.ID,
+		}
+
+		return resp, nil
 	}
-
-	// ID creation and other validations; This is more useful for new entities
-	// and may not perform anything for the existing entities. Placing the
-	// check here to make the flow common for both new and existing entities.
-	err = i.sanitizeEntity(entity)
-	if err != nil {
-		return nil, err
-	}
-
-	// Update the fields
-	alias.Name = aliasName
-	alias.Metadata = aliasMetadata
-	alias.MountType = mountValidationResp.MountType
-	alias.MountAccessor = mountValidationResp.MountAccessor
-	alias.MountPath = mountValidationResp.MountPath
-
-	// Set the entity ID in the alias index. This should be done after
-	// sanitizing entity.
-	alias.EntityID = entity.ID
-
-	// ID creation and other validations
-	err = i.sanitizeAlias(alias)
-	if err != nil {
-		return nil, err
-	}
-
-	// Index entity and its aliases in MemDB and persist entity along with
-	// aliases in storage. If the alias is being transferred over from
-	// one entity to another, previous entity needs to get refreshed in MemDB
-	// and persisted in storage as well.
-	err = i.upsertEntity(entity, previousEntity, true)
-	if err != nil {
-		return nil, err
-	}
-
-	// Return ID of both alias and entity
-	resp.Data = map[string]interface{}{
-		"id":        alias.ID,
-		"entity_id": entity.ID,
-	}
-
-	return resp, nil
 }
 
-// pathAliasIDRead returns the properties of a alias for a given
+// pathAliasIDRead returns the properties of an alias for a given
 // alias ID
-func (i *IdentityStore) pathAliasIDRead(req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
-	aliasID := d.Get("id").(string)
-	if aliasID == "" {
-		return logical.ErrorResponse("missing alias id"), nil
+func (i *IdentityStore) pathAliasIDRead() framework.OperationFunc {
+	return func(ctx context.Context, req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
+		aliasID := d.Get("id").(string)
+		if aliasID == "" {
+			return logical.ErrorResponse("missing alias id"), nil
+		}
+
+		alias, err := i.MemDBAliasByID(aliasID, false, false)
+		if err != nil {
+			return nil, err
+		}
+
+		return i.handleAliasReadCommon(ctx, alias)
+	}
+}
+
+func (i *IdentityStore) handleAliasReadCommon(ctx context.Context, alias *identity.Alias) (*logical.Response, error) {
+	if alias == nil {
+		return nil, nil
 	}
 
-	alias, err := i.memDBAliasByID(aliasID, false)
+	ns, err := namespace.FromContext(ctx)
 	if err != nil {
 		return nil, err
 	}
-
-	if alias == nil {
+	if ns.ID != alias.NamespaceID {
 		return nil, nil
 	}
 
 	respData := map[string]interface{}{}
 	respData["id"] = alias.ID
-	respData["entity_id"] = alias.EntityID
-	respData["mount_type"] = alias.MountType
+	respData["canonical_id"] = alias.CanonicalID
 	respData["mount_accessor"] = alias.MountAccessor
-	respData["mount_path"] = alias.MountPath
 	respData["metadata"] = alias.Metadata
 	respData["name"] = alias.Name
-	respData["merged_from_entity_ids"] = alias.MergedFromEntityIDs
+	respData["merged_from_canonical_ids"] = alias.MergedFromCanonicalIDs
+
+	if mountValidationResp := i.core.router.validateMountByAccessor(alias.MountAccessor); mountValidationResp != nil {
+		respData["mount_path"] = mountValidationResp.MountPath
+		respData["mount_type"] = mountValidationResp.MountType
+	}
 
 	// Convert protobuf timestamp into RFC3339 format
 	respData["creation_time"] = ptypes.TimestampString(alias.CreationTime)
@@ -317,48 +335,109 @@ func (i *IdentityStore) pathAliasIDRead(req *logical.Request, d *framework.Field
 	}, nil
 }
 
-// pathAliasIDDelete deleted the alias for a given alias ID
-func (i *IdentityStore) pathAliasIDDelete(req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
-	aliasID := d.Get("id").(string)
-	if aliasID == "" {
-		return logical.ErrorResponse("missing alias ID"), nil
-	}
+// pathAliasIDDelete deletes the alias for a given alias ID
+func (i *IdentityStore) pathAliasIDDelete() framework.OperationFunc {
+	return func(ctx context.Context, req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
+		aliasID := d.Get("id").(string)
+		if aliasID == "" {
+			return logical.ErrorResponse("missing alias ID"), nil
+		}
 
-	return nil, i.deleteAlias(aliasID)
+		i.lock.Lock()
+		defer i.lock.Unlock()
+
+		// Create a MemDB transaction to delete entity
+		txn := i.db.Txn(true)
+		defer txn.Abort()
+
+		// Fetch the alias
+		alias, err := i.MemDBAliasByIDInTxn(txn, aliasID, false, false)
+		if err != nil {
+			return nil, err
+		}
+
+		// If there is no alias for the ID, do nothing
+		if alias == nil {
+			return nil, nil
+		}
+
+		ns, err := namespace.FromContext(ctx)
+		if err != nil {
+			return nil, err
+		}
+		if ns.ID != alias.NamespaceID {
+			return nil, logical.ErrUnsupportedPath
+		}
+
+		// Fetch the associated entity
+		entity, err := i.MemDBEntityByAliasIDInTxn(txn, alias.ID, true)
+		if err != nil {
+			return nil, err
+		}
+
+		// If there is no entity tied to a valid alias, something is wrong
+		if entity == nil {
+			return nil, fmt.Errorf("alias not associated to an entity")
+		}
+
+		aliases := []*identity.Alias{
+			alias,
+		}
+
+		// Delete alias from the entity object
+		err = i.deleteAliasesInEntityInTxn(txn, entity, aliases)
+		if err != nil {
+			return nil, err
+		}
+
+		// Update the entity index in the entities table
+		err = i.MemDBUpsertEntityInTxn(txn, entity)
+		if err != nil {
+			return nil, err
+		}
+
+		// Persist the entity object
+		entityAsAny, err := ptypes.MarshalAny(entity)
+		if err != nil {
+			return nil, err
+		}
+		item := &storagepacker.Item{
+			ID:      entity.ID,
+			Message: entityAsAny,
+		}
+
+		err = i.entityPacker.PutItem(item)
+		if err != nil {
+			return nil, err
+		}
+
+		// Committing the transaction *after* successfully updating entity in
+		// storage
+		txn.Commit()
+
+		return nil, nil
+	}
 }
 
 // pathAliasIDList lists the IDs of all the valid aliases in the identity
 // store
-func (i *IdentityStore) pathAliasIDList(req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
-	ws := memdb.NewWatchSet()
-	iter, err := i.memDBAliases(ws)
-	if err != nil {
-		return nil, fmt.Errorf("failed to fetch iterator for aliases in memdb: %v", err)
+func (i *IdentityStore) pathAliasIDList() framework.OperationFunc {
+	return func(ctx context.Context, req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
+		return i.handleAliasListCommon(ctx, false)
 	}
-
-	var aliasIDs []string
-	for {
-		raw := iter.Next()
-		if raw == nil {
-			break
-		}
-		aliasIDs = append(aliasIDs, raw.(*identity.Alias).ID)
-	}
-
-	return logical.ListResponse(aliasIDs), nil
 }
 
 var aliasHelp = map[string][2]string{
 	"alias": {
-		"Create a new alias",
+		"Create a new alias.",
 		"",
 	},
 	"alias-id": {
-		"Update, read or delete an entity using alias ID",
+		"Update, read or delete an alias ID.",
 		"",
 	},
 	"alias-id-list": {
-		"List all the entity IDs",
+		"List all the alias IDs.",
 		"",
 	},
 }

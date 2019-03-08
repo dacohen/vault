@@ -7,17 +7,25 @@ import (
 	"testing"
 	"time"
 
+	log "github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/vault/helper/awsutil"
-	"github.com/hashicorp/vault/helper/logformat"
+	"github.com/hashicorp/vault/helper/logging"
 	"github.com/hashicorp/vault/physical"
-	log "github.com/mgutz/logxi/v1"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/s3"
 )
 
-func TestS3Backend(t *testing.T) {
+func TestDefaultS3Backend(t *testing.T) {
+	DoS3BackendTest(t, "")
+}
+
+func TestS3BackendSseKms(t *testing.T) {
+	DoS3BackendTest(t, "alias/aws/s3")
+}
+
+func DoS3BackendTest(t *testing.T, kmsKeyId string) {
 	credsConfig := &awsutil.CredentialsConfig{}
 
 	credsChain, err := credsConfig.GenerateCredentialChain()
@@ -79,11 +87,12 @@ func TestS3Backend(t *testing.T) {
 		}
 	}()
 
-	logger := logformat.NewVaultLogger(log.LevelTrace)
+	logger := logging.NewVaultLogger(log.Debug)
 
 	// This uses the same logic to find the AWS credentials as we did at the beginning of the test
 	b, err := NewS3Backend(map[string]string{
-		"bucket": bucket,
+		"bucket":   bucket,
+		"kmsKeyId": kmsKeyId,
 	}, logger)
 	if err != nil {
 		t.Fatalf("err: %s", err)

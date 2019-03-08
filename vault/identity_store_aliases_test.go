@@ -2,65 +2,166 @@ package vault
 
 import (
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/hashicorp/vault/helper/identity"
+	"github.com/hashicorp/vault/helper/namespace"
 	"github.com/hashicorp/vault/logical"
 )
 
-func TestIdentityStore_ListAlias(t *testing.T) {
-	var err error
-	var resp *logical.Response
+// Issue 5729
+func TestIdentityStore_DuplicateAliases(t *testing.T) {
+	c, _, _ := TestCoreUnsealed(t)
 
-	is, githubAccessor, _ := testIdentityStoreWithGithubAuth(t)
-
-	entityReq := &logical.Request{
-		Operation: logical.UpdateOperation,
-		Path:      "entity",
-	}
-	resp, err = is.HandleRequest(entityReq)
+	resp, err := c.systemBackend.HandleRequest(namespace.RootContext(nil), &logical.Request{
+		Path:      "auth",
+		Operation: logical.ReadOperation,
+	})
 	if err != nil || (resp != nil && resp.IsError()) {
-		t.Fatalf("err:%v resp:%#v", err, resp)
+		t.Fatalf("bad: resp: %#v\nerr: %v", resp, err)
 	}
-	if resp == nil {
-		t.Fatalf("expected a non-nil response")
+
+	tokenMountAccessor := resp.Data["token/"].(map[string]interface{})["accessor"].(string)
+
+	// Create an entity and attach an alias to it
+	resp, err = c.identityStore.HandleRequest(namespace.RootContext(nil), &logical.Request{
+		Path:      "entity-alias",
+		Operation: logical.UpdateOperation,
+		Data: map[string]interface{}{
+			"mount_accessor": tokenMountAccessor,
+			"name":           "testaliasname",
+		},
+	})
+	if err != nil || (resp != nil && resp.IsError()) {
+		t.Fatalf("bad: resp: %#v\nerr: %v", resp, err)
+	}
+	aliasID := resp.Data["id"].(string)
+
+	// Create another entity without an alias
+	resp, err = c.identityStore.HandleRequest(namespace.RootContext(nil), &logical.Request{
+		Path:      "entity",
+		Operation: logical.UpdateOperation,
+	})
+	if err != nil || (resp != nil && resp.IsError()) {
+		t.Fatalf("bad: resp: %#v\nerr: %v", resp, err)
+	}
+	entityID2 := resp.Data["id"].(string)
+
+	// Set the second entity ID as the canonical ID for the previous alias,
+	// initiating an alias transfer
+	resp, err = c.identityStore.HandleRequest(namespace.RootContext(nil), &logical.Request{
+		Path:      "entity-alias/id/" + aliasID,
+		Operation: logical.UpdateOperation,
+		Data: map[string]interface{}{
+			"canonical_id": entityID2,
+		},
+	})
+	if err != nil || (resp != nil && resp.IsError()) {
+		t.Fatalf("bad: resp: %#v\nerr: %v", resp, err)
+	}
+
+	// Read the new entity
+	resp, err = c.identityStore.HandleRequest(namespace.RootContext(nil), &logical.Request{
+		Path:      "entity/id/" + entityID2,
+		Operation: logical.ReadOperation,
+	})
+	if err != nil || (resp != nil && resp.IsError()) {
+		t.Fatalf("bad: resp: %#v\nerr: %v", resp, err)
+	}
+
+	// Ensure that there is only one alias
+	aliases := resp.Data["aliases"].([]interface{})
+	if len(aliases) != 1 {
+		t.Fatalf("bad: length of aliases; expected: %d, actual: %d", 1, len(aliases))
+	}
+
+	// Ensure that no merging activity has taken place
+	if len(aliases[0].(map[string]interface{})["merged_from_canonical_ids"].([]string)) != 0 {
+		t.Fatalf("expected no merging to take place")
+	}
+}
+
+func TestIdentityStore_CaseInsensitiveEntityAliasName(t *testing.T) {
+	ctx := namespace.RootContext(nil)
+	i, accessor, _ := testIdentityStoreWithGithubAuth(ctx, t)
+
+	// Create an entity
+	resp, err := i.HandleRequest(ctx, &logical.Request{
+		Path:      "entity",
+		Operation: logical.UpdateOperation,
+	})
+	if err != nil || (resp != nil && resp.IsError()) {
+		t.Fatalf("bad: err:%v\nresp: %#v", err, resp)
 	}
 	entityID := resp.Data["id"].(string)
 
-	// Create a alias
-	aliasData := map[string]interface{}{
-		"name":           "testaliasname",
-		"mount_accessor": githubAccessor,
-	}
-	aliasReq := &logical.Request{
+	testAliasName := "testAliasName"
+	// Create a case sensitive alias name
+	resp, err = i.HandleRequest(ctx, &logical.Request{
+		Path:      "entity-alias",
 		Operation: logical.UpdateOperation,
-		Path:      "alias",
-		Data:      aliasData,
-	}
-	resp, err = is.HandleRequest(aliasReq)
+		Data: map[string]interface{}{
+			"mount_accessor": accessor,
+			"canonical_id":   entityID,
+			"name":           testAliasName,
+		},
+	})
 	if err != nil || (resp != nil && resp.IsError()) {
-		t.Fatalf("err:%v resp:%#v", err, resp)
+		t.Fatalf("bad: err:%v\nresp: %#v", err, resp)
+	}
+	aliasID := resp.Data["id"].(string)
+
+	// Ensure that reading the alias returns case sensitive alias name
+	resp, err = i.HandleRequest(ctx, &logical.Request{
+		Path:      "entity-alias/id/" + aliasID,
+		Operation: logical.ReadOperation,
+	})
+	if err != nil || (resp != nil && resp.IsError()) {
+		t.Fatalf("bad: err:%v\nresp: %#v", err, resp)
+	}
+	aliasName := resp.Data["name"].(string)
+	if aliasName != testAliasName {
+		t.Fatalf("bad alias name; expected: %q, actual: %q", testAliasName, aliasName)
 	}
 
-	aliasData["name"] = "entityalias"
-	aliasData["entity_id"] = entityID
-	resp, err = is.HandleRequest(aliasReq)
+	// Overwrite the alias using lower cased alias name. This shouldn't error.
+	resp, err = i.HandleRequest(ctx, &logical.Request{
+		Path:      "entity-alias/id/" + aliasID,
+		Operation: logical.UpdateOperation,
+		Data: map[string]interface{}{
+			"mount_accessor": accessor,
+			"canonical_id":   entityID,
+			"name":           strings.ToLower(testAliasName),
+		},
+	})
 	if err != nil || (resp != nil && resp.IsError()) {
-		t.Fatalf("err:%v resp:%#v", err, resp)
+		t.Fatalf("bad: err:%v\nresp: %#v", err, resp)
 	}
 
-	listReq := &logical.Request{
+	// Ensure that reading the alias returns lower cased alias name
+	resp, err = i.HandleRequest(ctx, &logical.Request{
+		Path:      "entity-alias/id/" + aliasID,
+		Operation: logical.ReadOperation,
+	})
+	if err != nil || (resp != nil && resp.IsError()) {
+		t.Fatalf("bad: err:%v\nresp: %#v", err, resp)
+	}
+	aliasName = resp.Data["name"].(string)
+	if aliasName != strings.ToLower(testAliasName) {
+		t.Fatalf("bad alias name; expected: %q, actual: %q", testAliasName, aliasName)
+	}
+
+	// Ensure that there is one entity alias
+	resp, err = i.HandleRequest(ctx, &logical.Request{
+		Path:      "entity-alias/id",
 		Operation: logical.ListOperation,
-		Path:      "alias/id",
-	}
-	resp, err = is.HandleRequest(listReq)
+	})
 	if err != nil || (resp != nil && resp.IsError()) {
-		t.Fatalf("err:%v resp:%#v", err, resp)
+		t.Fatalf("bad: err:%v\nresp: %#v", err, resp)
 	}
-
-	keys := resp.Data["keys"].([]string)
-	if len(keys) != 2 {
-		t.Fatalf("bad: lengh of alias IDs listed; expected: 2, actual: %d", len(keys))
+	if len(resp.Data["keys"].([]string)) != 1 {
+		t.Fatalf("bad length of entity aliases; expected: 1, actual: %d", len(resp.Data["keys"].([]string)))
 	}
 }
 
@@ -69,7 +170,9 @@ func TestIdentityStore_ListAlias(t *testing.T) {
 func TestIdentityStore_AliasSameAliasNames(t *testing.T) {
 	var err error
 	var resp *logical.Response
-	is, githubAccessor, _ := testIdentityStoreWithGithubAuth(t)
+
+	ctx := namespace.RootContext(nil)
+	is, githubAccessor, _ := testIdentityStoreWithGithubAuth(ctx, t)
 
 	aliasData := map[string]interface{}{
 		"name":           "testaliasname",
@@ -78,18 +181,18 @@ func TestIdentityStore_AliasSameAliasNames(t *testing.T) {
 
 	aliasReq := &logical.Request{
 		Operation: logical.UpdateOperation,
-		Path:      "alias",
+		Path:      "entity-alias",
 		Data:      aliasData,
 	}
 
-	// Register a alias
-	resp, err = is.HandleRequest(aliasReq)
+	// Register an alias
+	resp, err = is.HandleRequest(ctx, aliasReq)
 	if err != nil || (resp != nil && resp.IsError()) {
 		t.Fatalf("err:%v resp:%#v", err, resp)
 	}
 
 	// Register another alias with same name
-	resp, err = is.HandleRequest(aliasReq)
+	resp, err = is.HandleRequest(ctx, aliasReq)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -101,12 +204,13 @@ func TestIdentityStore_AliasSameAliasNames(t *testing.T) {
 func TestIdentityStore_MemDBAliasIndexes(t *testing.T) {
 	var err error
 
-	is, githubAccessor, _ := testIdentityStoreWithGithubAuth(t)
+	ctx := namespace.RootContext(nil)
+	is, githubAccessor, _ := testIdentityStoreWithGithubAuth(ctx, t)
 	if is == nil {
 		t.Fatal("failed to create test identity store")
 	}
 
-	validateMountResp := is.validateMountAccessorFunc(githubAccessor)
+	validateMountResp := is.core.router.validateMountByAccessor(githubAccessor)
 	if validateMountResp == nil {
 		t.Fatal("failed to validate github auth mount")
 	}
@@ -118,13 +222,16 @@ func TestIdentityStore_MemDBAliasIndexes(t *testing.T) {
 
 	entity.BucketKeyHash = is.entityPacker.BucketKeyHashByItemID(entity.ID)
 
-	err = is.memDBUpsertEntity(entity)
+	txn := is.db.Txn(true)
+	defer txn.Abort()
+	err = is.MemDBUpsertEntityInTxn(txn, entity)
 	if err != nil {
 		t.Fatal(err)
 	}
+	txn.Commit()
 
 	alias := &identity.Alias{
-		EntityID:      entity.ID,
+		CanonicalID:   entity.ID,
 		ID:            "testaliasid",
 		MountAccessor: githubAccessor,
 		MountType:     validateMountResp.MountType,
@@ -135,21 +242,15 @@ func TestIdentityStore_MemDBAliasIndexes(t *testing.T) {
 		},
 	}
 
-	err = is.memDBUpsertAlias(alias)
+	txn = is.db.Txn(true)
+	defer txn.Abort()
+	err = is.MemDBUpsertAliasInTxn(txn, alias, false)
 	if err != nil {
 		t.Fatal(err)
 	}
+	txn.Commit()
 
-	aliasFetched, err := is.memDBAliasByID("testaliasid", false)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if !reflect.DeepEqual(alias, aliasFetched) {
-		t.Fatalf("bad: mismatched aliases; expected: %#v\n actual: %#v\n", alias, aliasFetched)
-	}
-
-	aliasFetched, err = is.memDBAliasByEntityID(entity.ID, false)
+	aliasFetched, err := is.MemDBAliasByID("testaliasid", false, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -158,63 +259,17 @@ func TestIdentityStore_MemDBAliasIndexes(t *testing.T) {
 		t.Fatalf("bad: mismatched aliases; expected: %#v\n actual: %#v\n", alias, aliasFetched)
 	}
 
-	aliasFetched, err = is.memDBAliasByFactors(validateMountResp.MountAccessor, "testaliasname", false)
+	aliasFetched, err = is.MemDBAliasByFactors(validateMountResp.MountAccessor, "testaliasname", false, false)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	if !reflect.DeepEqual(alias, aliasFetched) {
-		t.Fatalf("bad: mismatched aliases; expected: %#v\n actual: %#v\n", alias, aliasFetched)
-	}
-
-	aliasesFetched, err := is.memDBAliasesByMetadata(map[string]string{
-		"testkey1": "testmetadatavalue1",
-	}, false)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if len(aliasesFetched) != 1 {
-		t.Fatalf("bad: length of aliases; expected: 1, actual: %d", len(aliasesFetched))
-	}
-
-	if !reflect.DeepEqual(alias, aliasesFetched[0]) {
-		t.Fatalf("bad: mismatched aliases; expected: %#v\n actual: %#v\n", alias, aliasFetched)
-	}
-
-	aliasesFetched, err = is.memDBAliasesByMetadata(map[string]string{
-		"testkey2": "testmetadatavalue2",
-	}, false)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if len(aliasesFetched) != 1 {
-		t.Fatalf("bad: length of aliases; expected: 1, actual: %d", len(aliasesFetched))
-	}
-
-	if !reflect.DeepEqual(alias, aliasesFetched[0]) {
-		t.Fatalf("bad: mismatched aliases; expected: %#v\n actual: %#v\n", alias, aliasFetched)
-	}
-
-	aliasesFetched, err = is.memDBAliasesByMetadata(map[string]string{
-		"testkey1": "testmetadatavalue1",
-		"testkey2": "testmetadatavalue2",
-	}, false)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if len(aliasesFetched) != 1 {
-		t.Fatalf("bad: length of aliases; expected: 1, actual: %d", len(aliasesFetched))
-	}
-
-	if !reflect.DeepEqual(alias, aliasesFetched[0]) {
 		t.Fatalf("bad: mismatched aliases; expected: %#v\n actual: %#v\n", alias, aliasFetched)
 	}
 
 	alias2 := &identity.Alias{
-		EntityID:      entity.ID,
+		CanonicalID:   entity.ID,
 		ID:            "testaliasid2",
 		MountAccessor: validateMountResp.MountAccessor,
 		MountType:     validateMountResp.MountType,
@@ -225,39 +280,19 @@ func TestIdentityStore_MemDBAliasIndexes(t *testing.T) {
 		},
 	}
 
-	err = is.memDBUpsertAlias(alias2)
+	txn = is.db.Txn(true)
+	defer txn.Abort()
+	err = is.MemDBUpsertAliasInTxn(txn, alias2, false)
 	if err != nil {
 		t.Fatal(err)
 	}
-
-	aliasesFetched, err = is.memDBAliasesByMetadata(map[string]string{
-		"testkey1": "testmetadatavalue1",
-	}, false)
+	err = is.MemDBDeleteAliasByIDInTxn(txn, "testaliasid", false)
 	if err != nil {
 		t.Fatal(err)
 	}
+	txn.Commit()
 
-	if len(aliasesFetched) != 2 {
-		t.Fatalf("bad: length of aliases; expected: 2, actual: %d", len(aliasesFetched))
-	}
-
-	aliasesFetched, err = is.memDBAliasesByMetadata(map[string]string{
-		"testkey3": "testmetadatavalue3",
-	}, false)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if len(aliasesFetched) != 1 {
-		t.Fatalf("bad: length of aliases; expected: 1, actual: %d", len(aliasesFetched))
-	}
-
-	err = is.memDBDeleteAliasByID("testaliasid")
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	aliasFetched, err = is.memDBAliasByID("testaliasid", false)
+	aliasFetched, err = is.MemDBAliasByID("testaliasid", false, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -271,7 +306,8 @@ func TestIdentityStore_AliasRegister(t *testing.T) {
 	var err error
 	var resp *logical.Response
 
-	is, githubAccessor, _ := testIdentityStoreWithGithubAuth(t)
+	ctx := namespace.RootContext(nil)
+	is, githubAccessor, _ := testIdentityStoreWithGithubAuth(ctx, t)
 
 	if is == nil {
 		t.Fatal("failed to create test alias store")
@@ -285,12 +321,12 @@ func TestIdentityStore_AliasRegister(t *testing.T) {
 
 	aliasReq := &logical.Request{
 		Operation: logical.UpdateOperation,
-		Path:      "alias",
+		Path:      "entity-alias",
 		Data:      aliasData,
 	}
 
 	// Register the alias
-	resp, err = is.HandleRequest(aliasReq)
+	resp, err = is.HandleRequest(ctx, aliasReq)
 	if err != nil || (resp != nil && resp.IsError()) {
 		t.Fatalf("err:%v resp:%#v", err, resp)
 	}
@@ -305,7 +341,7 @@ func TestIdentityStore_AliasRegister(t *testing.T) {
 		t.Fatalf("invalid alias id in alias register response")
 	}
 
-	entityIDRaw, ok := resp.Data["entity_id"]
+	entityIDRaw, ok := resp.Data["canonical_id"]
 	if !ok {
 		t.Fatalf("entity id not present in alias register response")
 	}
@@ -319,22 +355,22 @@ func TestIdentityStore_AliasRegister(t *testing.T) {
 func TestIdentityStore_AliasUpdate(t *testing.T) {
 	var err error
 	var resp *logical.Response
-	is, githubAccessor, _ := testIdentityStoreWithGithubAuth(t)
+	ctx := namespace.RootContext(nil)
+	is, githubAccessor, _ := testIdentityStoreWithGithubAuth(ctx, t)
 
 	aliasData := map[string]interface{}{
 		"name":           "testaliasname",
 		"mount_accessor": githubAccessor,
-		"metadata":       []string{"organization=hashicorp", "team=vault"},
 	}
 
 	aliasReq := &logical.Request{
 		Operation: logical.UpdateOperation,
-		Path:      "alias",
+		Path:      "entity-alias",
 		Data:      aliasData,
 	}
 
-	// This will create a alias and a corresponding entity
-	resp, err = is.HandleRequest(aliasReq)
+	// This will create an alias and a corresponding entity
+	resp, err = is.HandleRequest(ctx, aliasReq)
 	if err != nil || (resp != nil && resp.IsError()) {
 		t.Fatalf("err:%v resp:%#v", err, resp)
 	}
@@ -343,27 +379,22 @@ func TestIdentityStore_AliasUpdate(t *testing.T) {
 	updateData := map[string]interface{}{
 		"name":           "updatedaliasname",
 		"mount_accessor": githubAccessor,
-		"metadata":       []string{"organization=updatedorganization", "team=updatedteam"},
 	}
 
 	aliasReq.Data = updateData
-	aliasReq.Path = "alias/id/" + aliasID
-	resp, err = is.HandleRequest(aliasReq)
+	aliasReq.Path = "entity-alias/id/" + aliasID
+	resp, err = is.HandleRequest(ctx, aliasReq)
 	if err != nil || (resp != nil && resp.IsError()) {
 		t.Fatalf("err:%v resp:%#v", err, resp)
 	}
 
 	aliasReq.Operation = logical.ReadOperation
-	resp, err = is.HandleRequest(aliasReq)
+	resp, err = is.HandleRequest(ctx, aliasReq)
 	if err != nil || (resp != nil && resp.IsError()) {
 		t.Fatalf("err:%v resp:%#v", err, resp)
 	}
 
-	aliasMetadata := resp.Data["metadata"].(map[string]string)
-	updatedOrg := aliasMetadata["organization"]
-	updatedTeam := aliasMetadata["team"]
-
-	if resp.Data["name"] != "updatedaliasname" || updatedOrg != "updatedorganization" || updatedTeam != "updatedteam" {
+	if resp.Data["name"] != "updatedaliasname" {
 		t.Fatalf("failed to update alias information; \n response data: %#v\n", resp.Data)
 	}
 }
@@ -371,22 +402,22 @@ func TestIdentityStore_AliasUpdate(t *testing.T) {
 func TestIdentityStore_AliasUpdate_ByID(t *testing.T) {
 	var err error
 	var resp *logical.Response
-	is, githubAccessor, _ := testIdentityStoreWithGithubAuth(t)
+	ctx := namespace.RootContext(nil)
+	is, githubAccessor, _ := testIdentityStoreWithGithubAuth(ctx, t)
 
 	updateData := map[string]interface{}{
 		"name":           "updatedaliasname",
 		"mount_accessor": githubAccessor,
-		"metadata":       []string{"organization=updatedorganization", "team=updatedteam"},
 	}
 
 	updateReq := &logical.Request{
 		Operation: logical.UpdateOperation,
-		Path:      "alias/id/invalidaliasid",
+		Path:      "entity-alias/id/invalidaliasid",
 		Data:      updateData,
 	}
 
 	// Try to update an non-existent alias
-	resp, err = is.HandleRequest(updateReq)
+	resp, err = is.HandleRequest(ctx, updateReq)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -397,16 +428,15 @@ func TestIdentityStore_AliasUpdate_ByID(t *testing.T) {
 	registerData := map[string]interface{}{
 		"name":           "testaliasname",
 		"mount_accessor": githubAccessor,
-		"metadata":       []string{"organization=hashicorp", "team=vault"},
 	}
 
 	registerReq := &logical.Request{
 		Operation: logical.UpdateOperation,
-		Path:      "alias",
+		Path:      "entity-alias",
 		Data:      registerData,
 	}
 
-	resp, err = is.HandleRequest(registerReq)
+	resp, err = is.HandleRequest(ctx, registerReq)
 	if err != nil || (resp != nil && resp.IsError()) {
 		t.Fatalf("err:%v resp:%#v", err, resp)
 	}
@@ -420,8 +450,8 @@ func TestIdentityStore_AliasUpdate_ByID(t *testing.T) {
 		t.Fatalf("invalid alias id")
 	}
 
-	updateReq.Path = "alias/id/" + id
-	resp, err = is.HandleRequest(updateReq)
+	updateReq.Path = "entity-alias/id/" + id
+	resp, err = is.HandleRequest(ctx, updateReq)
 	if err != nil || (resp != nil && resp.IsError()) {
 		t.Fatalf("err:%v resp:%#v", err, resp)
 	}
@@ -430,22 +460,18 @@ func TestIdentityStore_AliasUpdate_ByID(t *testing.T) {
 		Operation: logical.ReadOperation,
 		Path:      updateReq.Path,
 	}
-	resp, err = is.HandleRequest(readReq)
+	resp, err = is.HandleRequest(ctx, readReq)
 	if err != nil || (resp != nil && resp.IsError()) {
 		t.Fatalf("err:%v resp:%#v", err, resp)
 	}
 
-	aliasMetadata := resp.Data["metadata"].(map[string]string)
-	updatedOrg := aliasMetadata["organization"]
-	updatedTeam := aliasMetadata["team"]
-
-	if resp.Data["name"] != "updatedaliasname" || updatedOrg != "updatedorganization" || updatedTeam != "updatedteam" {
+	if resp.Data["name"] != "updatedaliasname" {
 		t.Fatalf("failed to update alias information; \n response data: %#v\n", resp.Data)
 	}
 
 	delete(registerReq.Data, "name")
 
-	resp, err = is.HandleRequest(registerReq)
+	resp, err = is.HandleRequest(ctx, registerReq)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -456,7 +482,7 @@ func TestIdentityStore_AliasUpdate_ByID(t *testing.T) {
 	registerReq.Data["name"] = "testaliasname"
 	delete(registerReq.Data, "mount_accessor")
 
-	resp, err = is.HandleRequest(registerReq)
+	resp, err = is.HandleRequest(ctx, registerReq)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -469,7 +495,8 @@ func TestIdentityStore_AliasReadDelete(t *testing.T) {
 	var err error
 	var resp *logical.Response
 
-	is, githubAccessor, _ := testIdentityStoreWithGithubAuth(t)
+	ctx := namespace.RootContext(nil)
+	is, githubAccessor, _ := testIdentityStoreWithGithubAuth(ctx, t)
 
 	registerData := map[string]interface{}{
 		"name":           "testaliasname",
@@ -479,11 +506,11 @@ func TestIdentityStore_AliasReadDelete(t *testing.T) {
 
 	registerReq := &logical.Request{
 		Operation: logical.UpdateOperation,
-		Path:      "alias",
+		Path:      "entity-alias",
 		Data:      registerData,
 	}
 
-	resp, err = is.HandleRequest(registerReq)
+	resp, err = is.HandleRequest(ctx, registerReq)
 	if err != nil || (resp != nil && resp.IsError()) {
 		t.Fatalf("err:%v resp:%#v", err, resp)
 	}
@@ -500,28 +527,28 @@ func TestIdentityStore_AliasReadDelete(t *testing.T) {
 	// Read it back using alias id
 	aliasReq := &logical.Request{
 		Operation: logical.ReadOperation,
-		Path:      "alias/id/" + id,
+		Path:      "entity-alias/id/" + id,
 	}
-	resp, err = is.HandleRequest(aliasReq)
+	resp, err = is.HandleRequest(ctx, aliasReq)
 	if err != nil || (resp != nil && resp.IsError()) {
 		t.Fatalf("err:%v resp:%#v", err, resp)
 	}
 
 	if resp.Data["id"].(string) == "" ||
-		resp.Data["entity_id"].(string) == "" ||
+		resp.Data["canonical_id"].(string) == "" ||
 		resp.Data["name"].(string) != registerData["name"] ||
 		resp.Data["mount_type"].(string) != "github" {
 		t.Fatalf("bad: alias read response; \nexpected: %#v \nactual: %#v\n", registerData, resp.Data)
 	}
 
 	aliasReq.Operation = logical.DeleteOperation
-	resp, err = is.HandleRequest(aliasReq)
+	resp, err = is.HandleRequest(ctx, aliasReq)
 	if err != nil || (resp != nil && resp.IsError()) {
 		t.Fatalf("err:%v resp:%#v", err, resp)
 	}
 
 	aliasReq.Operation = logical.ReadOperation
-	resp, err = is.HandleRequest(aliasReq)
+	resp, err = is.HandleRequest(ctx, aliasReq)
 	if err != nil || (resp != nil && resp.IsError()) {
 		t.Fatalf("err:%v resp:%#v", err, resp)
 	}

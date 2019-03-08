@@ -18,11 +18,22 @@ type Client struct {
 	// retry).
 	Retry time.Duration
 
+	// MaxPacketErrors controls how many packet parsing and validation errors
+	// the client will ignore before returning the error from Exchange.
+	//
+	// If zero, Exchange will drop all packet parsing errors.
+	MaxPacketErrors int
+
+	// InsecureSkipVerify controls whether the client should skip verifying
+	// response packets received.
 	InsecureSkipVerify bool
 }
 
 // DefaultClient is the RADIUS client used by the Exchange function.
-var DefaultClient = &Client{}
+var DefaultClient = &Client{
+	Retry:           time.Second,
+	MaxPacketErrors: 10,
+}
 
 // Exchange uses DefaultClient to send the given RADIUS packet to the server at
 // address addr and waits for a response.
@@ -49,44 +60,71 @@ func (c *Client) Exchange(ctx context.Context, packet *Packet, addr string) (*Pa
 
 	conn, err := c.Dialer.DialContext(ctx, connNet, addr)
 	if err != nil {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		default:
+		}
 		return nil, err
 	}
 	defer conn.Close()
 
-	if deadline, deadlineSet := ctx.Deadline(); deadlineSet {
-		conn.SetDeadline(deadline)
-	}
-
 	conn.Write(wire)
 
+	var cancel context.CancelFunc
+	ctx, cancel = context.WithCancel(ctx)
+	defer cancel()
+
+	var retryTimer <-chan time.Time
 	if c.Retry > 0 {
 		retry := time.NewTicker(c.Retry)
 		defer retry.Stop()
-		end := make(chan struct{})
-		defer close(end)
-		go func() {
-			for {
-				select {
-				case <-retry.C:
-					conn.Write(wire)
-				case <-ctx.Done():
-					return
-				case <-end:
-					return
-				}
-			}
-		}()
+		retryTimer = retry.C
 	}
+
+	go func() {
+		defer conn.Close()
+		for {
+			select {
+			case <-retryTimer:
+				conn.Write(wire)
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+
+	var packetErrorCount int
 
 	var incoming [MaxPacketLength]byte
 	for {
 		n, err := conn.Read(incoming[:])
 		if err != nil {
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			default:
+			}
 			return nil, err
 		}
+
 		received, err := Parse(incoming[:n], packet.Secret)
-		if err == nil && (!c.InsecureSkipVerify && IsAuthenticResponse(incoming[:n], wire, packet.Secret)) {
-			return received, nil
+		if err != nil {
+			packetErrorCount++
+			if c.MaxPacketErrors > 0 && packetErrorCount >= c.MaxPacketErrors {
+				return nil, err
+			}
+			continue
 		}
+
+		if !c.InsecureSkipVerify && !IsAuthenticResponse(incoming[:n], wire, packet.Secret) {
+			packetErrorCount++
+			if c.MaxPacketErrors > 0 && packetErrorCount >= c.MaxPacketErrors {
+				return nil, &NonAuthenticResponseError{}
+			}
+			continue
+		}
+
+		return received, nil
 	}
 }

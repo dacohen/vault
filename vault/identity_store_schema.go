@@ -6,19 +6,27 @@ import (
 	memdb "github.com/hashicorp/go-memdb"
 )
 
-func identityStoreSchema() *memdb.DBSchema {
+const (
+	entitiesTable      = "entities"
+	entityAliasesTable = "entity_aliases"
+	groupsTable        = "groups"
+	groupAliasesTable  = "group_aliases"
+)
+
+func identityStoreSchema(lowerCaseName bool) *memdb.DBSchema {
 	iStoreSchema := &memdb.DBSchema{
 		Tables: make(map[string]*memdb.TableSchema),
 	}
 
-	schemas := []func() *memdb.TableSchema{
-		entityTableSchema,
+	schemas := []func(bool) *memdb.TableSchema{
+		entitiesTableSchema,
 		aliasesTableSchema,
-		groupTableSchema,
+		groupsTableSchema,
+		groupAliasesTableSchema,
 	}
 
 	for _, schemaFunc := range schemas {
-		schema := schemaFunc()
+		schema := schemaFunc(lowerCaseName)
 		if _, ok := iStoreSchema.Tables[schema.Name]; ok {
 			panic(fmt.Sprintf("duplicate table name: %s", schema.Name))
 		}
@@ -28,29 +36,15 @@ func identityStoreSchema() *memdb.DBSchema {
 	return iStoreSchema
 }
 
-func aliasesTableSchema() *memdb.TableSchema {
+func aliasesTableSchema(lowerCaseName bool) *memdb.TableSchema {
 	return &memdb.TableSchema{
-		Name: "aliases",
+		Name: entityAliasesTable,
 		Indexes: map[string]*memdb.IndexSchema{
 			"id": &memdb.IndexSchema{
 				Name:   "id",
 				Unique: true,
 				Indexer: &memdb.StringFieldIndex{
 					Field: "ID",
-				},
-			},
-			"entity_id": &memdb.IndexSchema{
-				Name:   "entity_id",
-				Unique: false,
-				Indexer: &memdb.StringFieldIndex{
-					Field: "EntityID",
-				},
-			},
-			"mount_type": &memdb.IndexSchema{
-				Name:   "mount_type",
-				Unique: false,
-				Indexer: &memdb.StringFieldIndex{
-					Field: "MountType",
 				},
 			},
 			"factors": &memdb.IndexSchema{
@@ -62,26 +56,25 @@ func aliasesTableSchema() *memdb.TableSchema {
 							Field: "MountAccessor",
 						},
 						&memdb.StringFieldIndex{
-							Field: "Name",
+							Field:     "Name",
+							Lowercase: lowerCaseName,
 						},
 					},
 				},
 			},
-			"metadata": &memdb.IndexSchema{
-				Name:         "metadata",
-				Unique:       false,
-				AllowMissing: true,
-				Indexer: &memdb.StringMapFieldIndex{
-					Field: "Metadata",
+			"namespace_id": &memdb.IndexSchema{
+				Name: "namespace_id",
+				Indexer: &memdb.StringFieldIndex{
+					Field: "NamespaceID",
 				},
 			},
 		},
 	}
 }
 
-func entityTableSchema() *memdb.TableSchema {
+func entitiesTableSchema(lowerCaseName bool) *memdb.TableSchema {
 	return &memdb.TableSchema{
-		Name: "entities",
+		Name: entitiesTable,
 		Indexes: map[string]*memdb.IndexSchema{
 			"id": &memdb.IndexSchema{
 				Name:   "id",
@@ -93,16 +86,16 @@ func entityTableSchema() *memdb.TableSchema {
 			"name": &memdb.IndexSchema{
 				Name:   "name",
 				Unique: true,
-				Indexer: &memdb.StringFieldIndex{
-					Field: "Name",
-				},
-			},
-			"metadata": &memdb.IndexSchema{
-				Name:         "metadata",
-				Unique:       false,
-				AllowMissing: true,
-				Indexer: &memdb.StringMapFieldIndex{
-					Field: "Metadata",
+				Indexer: &memdb.CompoundIndex{
+					Indexes: []memdb.Indexer{
+						&memdb.StringFieldIndex{
+							Field: "NamespaceID",
+						},
+						&memdb.StringFieldIndex{
+							Field:     "Name",
+							Lowercase: lowerCaseName,
+						},
+					},
 				},
 			},
 			"merged_entity_ids": &memdb.IndexSchema{
@@ -114,20 +107,24 @@ func entityTableSchema() *memdb.TableSchema {
 				},
 			},
 			"bucket_key_hash": &memdb.IndexSchema{
-				Name:         "bucket_key_hash",
-				Unique:       false,
-				AllowMissing: false,
+				Name: "bucket_key_hash",
 				Indexer: &memdb.StringFieldIndex{
 					Field: "BucketKeyHash",
+				},
+			},
+			"namespace_id": &memdb.IndexSchema{
+				Name: "namespace_id",
+				Indexer: &memdb.StringFieldIndex{
+					Field: "NamespaceID",
 				},
 			},
 		},
 	}
 }
 
-func groupTableSchema() *memdb.TableSchema {
+func groupsTableSchema(lowerCaseName bool) *memdb.TableSchema {
 	return &memdb.TableSchema{
-		Name: "groups",
+		Name: groupsTable,
 		Indexes: map[string]*memdb.IndexSchema{
 			"id": {
 				Name:   "id",
@@ -139,13 +136,20 @@ func groupTableSchema() *memdb.TableSchema {
 			"name": {
 				Name:   "name",
 				Unique: true,
-				Indexer: &memdb.StringFieldIndex{
-					Field: "Name",
+				Indexer: &memdb.CompoundIndex{
+					Indexes: []memdb.Indexer{
+						&memdb.StringFieldIndex{
+							Field: "NamespaceID",
+						},
+						&memdb.StringFieldIndex{
+							Field:     "Name",
+							Lowercase: lowerCaseName,
+						},
+					},
 				},
 			},
 			"member_entity_ids": {
 				Name:         "member_entity_ids",
-				Unique:       false,
 				AllowMissing: true,
 				Indexer: &memdb.StringSliceFieldIndex{
 					Field: "MemberEntityIDs",
@@ -153,26 +157,57 @@ func groupTableSchema() *memdb.TableSchema {
 			},
 			"parent_group_ids": {
 				Name:         "parent_group_ids",
-				Unique:       false,
 				AllowMissing: true,
 				Indexer: &memdb.StringSliceFieldIndex{
 					Field: "ParentGroupIDs",
 				},
 			},
-			"policies": {
-				Name:         "policies",
-				Unique:       false,
-				AllowMissing: true,
-				Indexer: &memdb.StringSliceFieldIndex{
-					Field: "Policies",
-				},
-			},
 			"bucket_key_hash": &memdb.IndexSchema{
-				Name:         "bucket_key_hash",
-				Unique:       false,
-				AllowMissing: false,
+				Name: "bucket_key_hash",
 				Indexer: &memdb.StringFieldIndex{
 					Field: "BucketKeyHash",
+				},
+			},
+			"namespace_id": &memdb.IndexSchema{
+				Name: "namespace_id",
+				Indexer: &memdb.StringFieldIndex{
+					Field: "NamespaceID",
+				},
+			},
+		},
+	}
+}
+
+func groupAliasesTableSchema(lowerCaseName bool) *memdb.TableSchema {
+	return &memdb.TableSchema{
+		Name: groupAliasesTable,
+		Indexes: map[string]*memdb.IndexSchema{
+			"id": &memdb.IndexSchema{
+				Name:   "id",
+				Unique: true,
+				Indexer: &memdb.StringFieldIndex{
+					Field: "ID",
+				},
+			},
+			"factors": &memdb.IndexSchema{
+				Name:   "factors",
+				Unique: true,
+				Indexer: &memdb.CompoundIndex{
+					Indexes: []memdb.Indexer{
+						&memdb.StringFieldIndex{
+							Field: "MountAccessor",
+						},
+						&memdb.StringFieldIndex{
+							Field:     "Name",
+							Lowercase: lowerCaseName,
+						},
+					},
+				},
+			},
+			"namespace_id": &memdb.IndexSchema{
+				Name: "namespace_id",
+				Indexer: &memdb.StringFieldIndex{
+					Field: "NamespaceID",
 				},
 			},
 		},

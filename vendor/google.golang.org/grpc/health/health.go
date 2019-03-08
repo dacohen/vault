@@ -16,7 +16,7 @@
  *
  */
 
-//go:generate protoc --go_out=plugins=grpc:. grpc_health_v1/health.proto
+//go:generate ./regenerate.sh
 
 // Package health provides some utility functions to health-check a server. The implementation
 // is based on protobuf. Users need to write their own implementations if other IDLs are used.
@@ -26,9 +26,9 @@ import (
 	"sync"
 
 	"golang.org/x/net/context"
-	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	healthpb "google.golang.org/grpc/health/grpc_health_v1"
+	"google.golang.org/grpc/status"
 )
 
 // Server implements `service Health`.
@@ -55,12 +55,17 @@ func (s *Server) Check(ctx context.Context, in *healthpb.HealthCheckRequest) (*h
 			Status: healthpb.HealthCheckResponse_SERVING,
 		}, nil
 	}
-	if status, ok := s.statusMap[in.Service]; ok {
+	if servingStatus, ok := s.statusMap[in.Service]; ok {
 		return &healthpb.HealthCheckResponse{
-			Status: status,
+			Status: servingStatus,
 		}, nil
 	}
-	return nil, grpc.Errorf(codes.NotFound, "unknown service")
+	return nil, status.Error(codes.NotFound, "unknown service")
+}
+
+// Watch implements `service Health`.
+func (s *Server) Watch(in *healthpb.HealthCheckRequest, stream healthpb.Health_WatchServer) error {
+	return status.Error(codes.Unimplemented, "Watching is not supported")
 }
 
 // SetServingStatus is called when need to reset the serving status of a service

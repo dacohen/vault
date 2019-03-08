@@ -1,7 +1,8 @@
 ---
 layout: "api"
 page_title: "/sys/tools - HTTP API"
-sidebar_current: "docs-http-system-tools"
+sidebar_title: "<code>/sys/tools</code>"
+sidebar_current: "api-http-system-tools"
 description: |-
   This is the API documentation for a general set of crypto  tools.
 ---
@@ -41,7 +42,7 @@ $ curl \
     --header "X-Vault-Token: ..." \
     --request POST \
     --data @payload.json \
-    https://vault.rocks/v1/sys/tools/random/164
+    http://127.0.0.1:8200/v1/sys/tools/random/164
 ```
 
 ### Sample Response
@@ -93,7 +94,7 @@ $ curl \
     --header "X-Vault-Token: ..." \
     --request POST \
     --data @payload.json \
-    https://vault.rocks/v1/sys/tools/hash/sha2-512
+    http://127.0.0.1:8200/v1/sys/tools/hash/sha2-512
 ```
 
 ### Sample Response

@@ -1,16 +1,18 @@
 package kubeauth
 
 import (
+	"context"
 	"crypto/ecdsa"
 	"crypto/rsa"
 	"errors"
 	"fmt"
-	"time"
 
-	"github.com/SermoDigital/jose/crypto"
-	"github.com/SermoDigital/jose/jws"
-	"github.com/SermoDigital/jose/jwt"
+	"github.com/briankassouf/jose/crypto"
+	"github.com/briankassouf/jose/jws"
+	"github.com/briankassouf/jose/jwt"
+	"github.com/hashicorp/errwrap"
 	multierror "github.com/hashicorp/go-multierror"
+	"github.com/hashicorp/vault/helper/cidrutil"
 	"github.com/hashicorp/vault/helper/strutil"
 	"github.com/hashicorp/vault/logical"
 	"github.com/hashicorp/vault/logical/framework"
@@ -19,9 +21,9 @@ import (
 
 var (
 	// expectedJWTIssuer is used to verify the iss header on the JWT.
-	expectedJWTIssuer string = "kubernetes/serviceaccount"
+	expectedJWTIssuer = "kubernetes/serviceaccount"
 
-	uidJWTClaimKey string = "kubernetes.io/serviceaccount/service-account.uid"
+	uidJWTClaimKey = "kubernetes.io/serviceaccount/service-account.uid"
 
 	// errMismatchedSigningMethod is used if the certificate doesn't match the
 	// JWT's expected signing method.
@@ -55,7 +57,7 @@ func pathLogin(b *kubeAuthBackend) *framework.Path {
 
 // pathLogin is used to authenticate to this backend
 func (b *kubeAuthBackend) pathLogin() framework.OperationFunc {
-	return func(req *logical.Request, data *framework.FieldData) (*logical.Response, error) {
+	return func(ctx context.Context, req *logical.Request, data *framework.FieldData) (*logical.Response, error) {
 		roleName := data.Get("role").(string)
 		if len(roleName) == 0 {
 			return logical.ErrorResponse("missing role"), nil
@@ -69,7 +71,7 @@ func (b *kubeAuthBackend) pathLogin() framework.OperationFunc {
 		b.l.RLock()
 		defer b.l.RUnlock()
 
-		role, err := b.role(req.Storage, roleName)
+		role, err := b.role(ctx, req.Storage, roleName)
 		if err != nil {
 			return nil, err
 		}
@@ -77,7 +79,12 @@ func (b *kubeAuthBackend) pathLogin() framework.OperationFunc {
 			return logical.ErrorResponse(fmt.Sprintf("invalid role name \"%s\"", roleName)), nil
 		}
 
-		config, err := b.config(req.Storage)
+		// Check for a CIDR match.
+		if req.Connection != nil && !cidrutil.RemoteAddrIsOk(req.Connection.RemoteAddr, role.BoundCIDRs) {
+			return logical.ErrorResponse("request originated from invalid CIDR"), nil
+		}
+
+		config, err := b.config(ctx, req.Storage)
 		if err != nil {
 			return nil, err
 		}
@@ -101,33 +108,33 @@ func (b *kubeAuthBackend) pathLogin() framework.OperationFunc {
 				NumUses: role.NumUses,
 				Period:  role.Period,
 				Alias: &logical.Alias{
-					Name: serviceAccount.UID,
+					Name: serviceAccount.uid(),
+					Metadata: map[string]string{
+						"service_account_uid":         serviceAccount.uid(),
+						"service_account_name":        serviceAccount.name(),
+						"service_account_namespace":   serviceAccount.namespace(),
+						"service_account_secret_name": serviceAccount.SecretName,
+					},
 				},
 				InternalData: map[string]interface{}{
 					"role": roleName,
 				},
 				Policies: role.Policies,
 				Metadata: map[string]string{
-					"service_account_uid":         serviceAccount.UID,
-					"service_account_name":        serviceAccount.Name,
-					"service_account_namespace":   serviceAccount.Namespace,
+					"service_account_uid":         serviceAccount.uid(),
+					"service_account_name":        serviceAccount.name(),
+					"service_account_namespace":   serviceAccount.namespace(),
 					"service_account_secret_name": serviceAccount.SecretName,
-					"role": roleName,
+					"role":                        roleName,
 				},
-				DisplayName: serviceAccount.Name,
+				DisplayName: fmt.Sprintf("%s-%s", serviceAccount.namespace(), serviceAccount.name()),
 				LeaseOptions: logical.LeaseOptions{
 					Renewable: true,
 					TTL:       role.TTL,
+					MaxTTL:    role.MaxTTL,
 				},
+				BoundCIDRs: role.BoundCIDRs,
 			},
-		}
-
-		// If 'Period' is set, use the value of 'Period' as the TTL.
-		// Otherwise, set the normal TTL.
-		if role.Period > time.Duration(0) {
-			resp.Auth.TTL = role.Period
-		} else {
-			resp.Auth.TTL = role.TTL
 		}
 
 		return resp, nil
@@ -137,7 +144,7 @@ func (b *kubeAuthBackend) pathLogin() framework.OperationFunc {
 // aliasLookahead returns the alias object with the SA UID from the JWT
 // Claims.
 func (b *kubeAuthBackend) aliasLookahead() framework.OperationFunc {
-	return func(req *logical.Request, data *framework.FieldData) (*logical.Response, error) {
+	return func(ctx context.Context, req *logical.Request, data *framework.FieldData) (*logical.Response, error) {
 		jwtStr := data.Get("jwt").(string)
 		if len(jwtStr) == 0 {
 			return logical.ErrorResponse("missing jwt"), nil
@@ -186,14 +193,14 @@ func (b *kubeAuthBackend) parseAndValidateJWT(jwtStr string, role *roleStorageEn
 
 			// verify the namespace is allowed
 			if len(role.ServiceAccountNamespaces) > 1 || role.ServiceAccountNamespaces[0] != "*" {
-				if !strutil.StrListContains(role.ServiceAccountNamespaces, sa.Namespace) {
+				if !strutil.StrListContains(role.ServiceAccountNamespaces, sa.namespace()) {
 					return errors.New("namespace not authorized")
 				}
 			}
 
 			// verify the service account name is allowed
 			if len(role.ServiceAccountNames) > 1 || role.ServiceAccountNames[0] != "*" {
-				if !strutil.StrListContains(role.ServiceAccountNames, sa.Name) {
+				if !strutil.StrListContains(role.ServiceAccountNames, sa.name()) {
 					return errors.New("service account name not authorized")
 				}
 			}
@@ -266,7 +273,7 @@ func (b *kubeAuthBackend) parseAndValidateJWT(jwtStr string, role *roleStorageEn
 			// if the error is a failure to verify or a signing method mismatch
 			// continue onto the next cert, storing the error to be returned if
 			// this is the last cert.
-			validationErr = multierror.Append(validationErr, err)
+			validationErr = multierror.Append(validationErr, errwrap.Wrapf("failed to validate JWT: {{err}}", err))
 			continue
 		default:
 			return nil, err
@@ -279,10 +286,57 @@ func (b *kubeAuthBackend) parseAndValidateJWT(jwtStr string, role *roleStorageEn
 // serviceAccount holds the metadata from the JWT token and is used to lookup
 // the JWT in the kubernetes API and compare the results.
 type serviceAccount struct {
-	Name       string `mapstructure:"kubernetes.io/serviceaccount/service-account.name"`
-	UID        string `mapstructure:"kubernetes.io/serviceaccount/service-account.uid"`
-	SecretName string `mapstructure:"kubernetes.io/serviceaccount/secret.name"`
-	Namespace  string `mapstructure:"kubernetes.io/serviceaccount/namespace"`
+	Name       string   `mapstructure:"kubernetes.io/serviceaccount/service-account.name"`
+	UID        string   `mapstructure:"kubernetes.io/serviceaccount/service-account.uid"`
+	SecretName string   `mapstructure:"kubernetes.io/serviceaccount/secret.name"`
+	Namespace  string   `mapstructure:"kubernetes.io/serviceaccount/namespace"`
+	Aud        []string `mapstructure:"aud"`
+
+	// the JSON returned from reviewing a Projected Service account has a
+	// different structure, where the information is in a sub-structure instead of
+	// at the top level
+	Kubernetes *projectedServiceToken `mapstructure:"kubernetes.io"`
+	Expiration int64                  `mapstructure:"exp"`
+	IssuedAt   int64                  `mapstructure:"iat"`
+}
+
+// uid returns the UID for the service account, preferring the projected service
+// account value if found
+func (s *serviceAccount) uid() string {
+	if s.Kubernetes != nil && s.Kubernetes.ServiceAccount != nil {
+		return s.Kubernetes.ServiceAccount.UID
+	}
+	return s.UID
+}
+
+// name returns the name for the service account, preferring the projected
+// service account value if found. This is "default" for projected service
+// accounts
+func (s *serviceAccount) name() string {
+	if s.Kubernetes != nil && s.Kubernetes.ServiceAccount != nil {
+		return s.Kubernetes.ServiceAccount.Name
+	}
+	return s.Name
+}
+
+// namespace returns the namespace for the service account, preferring the
+// projected service account value if found
+func (s *serviceAccount) namespace() string {
+	if s.Kubernetes != nil {
+		return s.Kubernetes.Namespace
+	}
+	return s.Namespace
+}
+
+type projectedServiceToken struct {
+	Namespace      string                      `mapstructure:"namespace"`
+	Pod            *projectedServiceAccountPod `mapstructure:"pod"`
+	ServiceAccount *projectedServiceAccountPod `mapstructure:"serviceaccount"`
+}
+
+type projectedServiceAccountPod struct {
+	Name string `mapstructure:"name"`
+	UID  string `mapstructure:"uid"`
 }
 
 // lookup calls the TokenReview API in kubernetes to verify the token and secret
@@ -295,13 +349,13 @@ func (s *serviceAccount) lookup(jwtStr string, tr tokenReviewer) error {
 
 	// Verify the returned metadata matches the expected data from the service
 	// account.
-	if s.Name != r.Name {
+	if s.name() != r.Name {
 		return errors.New("JWT names did not match")
 	}
-	if s.UID != r.UID {
+	if s.uid() != r.UID {
 		return errors.New("JWT UIDs did not match")
 	}
-	if s.Namespace != r.Namespace {
+	if s.namespace() != r.Namespace {
 		return errors.New("JWT namepaces did not match")
 	}
 
@@ -309,34 +363,31 @@ func (s *serviceAccount) lookup(jwtStr string, tr tokenReviewer) error {
 }
 
 // Invoked when the token issued by this backend is attempting a renewal.
-func (b *kubeAuthBackend) pathLoginRenew(req *logical.Request, data *framework.FieldData) (*logical.Response, error) {
-	roleName := req.Auth.InternalData["role"].(string)
-	if roleName == "" {
-		return nil, fmt.Errorf("failed to fetch role_name during renewal")
-	}
+func (b *kubeAuthBackend) pathLoginRenew() framework.OperationFunc {
+	return func(ctx context.Context, req *logical.Request, data *framework.FieldData) (*logical.Response, error) {
+		roleName := req.Auth.InternalData["role"].(string)
+		if roleName == "" {
+			return nil, fmt.Errorf("failed to fetch role_name during renewal")
+		}
 
-	b.l.RLock()
-	defer b.l.RUnlock()
+		b.l.RLock()
+		defer b.l.RUnlock()
 
-	// Ensure that the Role still exists.
-	role, err := b.role(req.Storage, roleName)
-	if err != nil {
-		return nil, fmt.Errorf("failed to validate role %s during renewal:%s", roleName, err)
-	}
-	if role == nil {
-		return nil, fmt.Errorf("role %s does not exist during renewal", roleName)
-	}
+		// Ensure that the Role still exists.
+		role, err := b.role(ctx, req.Storage, roleName)
+		if err != nil {
+			return nil, fmt.Errorf("failed to validate role %s during renewal:%s", roleName, err)
+		}
+		if role == nil {
+			return nil, fmt.Errorf("role %s does not exist during renewal", roleName)
+		}
 
-	// If 'Period' is set on the Role, the token should never expire.
-	// Replenish the TTL with 'Period's value.
-	if role.Period > time.Duration(0) {
-		// If 'Period' was updated after the token was issued,
-		// token will bear the updated 'Period' value as its TTL.
-		req.Auth.TTL = role.Period
-		return &logical.Response{Auth: req.Auth}, nil
+		resp := &logical.Response{Auth: req.Auth}
+		resp.Auth.TTL = role.TTL
+		resp.Auth.MaxTTL = role.MaxTTL
+		resp.Auth.Period = role.Period
+		return resp, nil
 	}
-
-	return framework.LeaseExtend(role.TTL, role.MaxTTL, b.System())(req, data)
 }
 
 const pathLoginHelpSyn = `Authenticates Kubernetes service accounts with Vault.`

@@ -6,9 +6,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/hashicorp/vault/helper/logformat"
+	log "github.com/hashicorp/go-hclog"
+	"github.com/hashicorp/vault/helper/logging"
 	"github.com/hashicorp/vault/physical"
-	log "github.com/mgutz/logxi/v1"
 )
 
 func TestEtcd3Backend(t *testing.T) {
@@ -17,22 +17,23 @@ func TestEtcd3Backend(t *testing.T) {
 		t.Skipf("Skipped. No etcd3 server found")
 	}
 
-	logger := logformat.NewVaultLogger(log.LevelTrace)
-
-	b, err := NewEtcdBackend(map[string]string{
+	logger := logging.NewVaultLogger(log.Debug)
+	config := map[string]string{
 		"path":     fmt.Sprintf("/vault-%d", time.Now().Unix()),
 		"etcd_api": "3",
-	}, logger)
+	}
+
+	b, err := NewEtcdBackend(config, logger)
+	if err != nil {
+		t.Fatalf("err: %s", err)
+	}
+
+	b2, err := NewEtcdBackend(config, logger)
 	if err != nil {
 		t.Fatalf("err: %s", err)
 	}
 
 	physical.ExerciseBackend(t, b)
 	physical.ExerciseBackend_ListPrefix(t, b)
-
-	ha, ok := b.(physical.HABackend)
-	if !ok {
-		t.Fatalf("etcd3 does not implement HABackend")
-	}
-	physical.ExerciseHABackend(t, ha, ha)
+	physical.ExerciseHABackend(t, b.(physical.HABackend), b2.(physical.HABackend))
 }

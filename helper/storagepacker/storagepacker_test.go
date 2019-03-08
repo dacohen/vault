@@ -1,18 +1,18 @@
 package storagepacker
 
 import (
-	"reflect"
 	"testing"
 
+	"github.com/golang/protobuf/proto"
 	"github.com/golang/protobuf/ptypes"
+	log "github.com/hashicorp/go-hclog"
 	uuid "github.com/hashicorp/go-uuid"
 	"github.com/hashicorp/vault/helper/identity"
 	"github.com/hashicorp/vault/logical"
-	log "github.com/mgutz/logxi/v1"
 )
 
 func BenchmarkStoragePacker(b *testing.B) {
-	storagePacker, err := NewStoragePacker(&logical.InmemStorage{}, log.New("storagepackertest"), "")
+	storagePacker, err := NewStoragePacker(&logical.InmemStorage{}, log.New(&log.LoggerOptions{Name: "storagepackertest"}), "")
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -61,7 +61,7 @@ func BenchmarkStoragePacker(b *testing.B) {
 }
 
 func TestStoragePacker(t *testing.T) {
-	storagePacker, err := NewStoragePacker(&logical.InmemStorage{}, log.New("storagepackertest"), "")
+	storagePacker, err := NewStoragePacker(&logical.InmemStorage{}, log.New(&log.LoggerOptions{Name: "storagepackertest"}), "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -107,7 +107,7 @@ func TestStoragePacker(t *testing.T) {
 }
 
 func TestStoragePacker_SerializeDeserializeComplexItem(t *testing.T) {
-	storagePacker, err := NewStoragePacker(&logical.InmemStorage{}, log.New("storagepackertest"), "")
+	storagePacker, err := NewStoragePacker(&logical.InmemStorage{}, log.New(&log.LoggerOptions{Name: "storagepackertest"}), "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -116,16 +116,16 @@ func TestStoragePacker_SerializeDeserializeComplexItem(t *testing.T) {
 
 	alias1 := &identity.Alias{
 		ID:            "alias_id",
-		EntityID:      "entity_id",
+		CanonicalID:   "canonical_id",
 		MountType:     "mount_type",
 		MountAccessor: "mount_accessor",
 		Metadata: map[string]string{
 			"aliasmkey": "aliasmvalue",
 		},
-		Name:                "alias_name",
-		CreationTime:        timeNow,
-		LastUpdateTime:      timeNow,
-		MergedFromEntityIDs: []string{"merged_from_entity_id"},
+		Name:                   "alias_name",
+		CreationTime:           timeNow,
+		LastUpdateTime:         timeNow,
+		MergedFromCanonicalIDs: []string{"merged_from_canonical_id"},
 	}
 
 	entity := &identity.Entity{
@@ -166,7 +166,7 @@ func TestStoragePacker_SerializeDeserializeComplexItem(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if !reflect.DeepEqual(&itemDecoded, entity) {
+	if !proto.Equal(&itemDecoded, entity) {
 		t.Fatalf("bad: expected: %#v\nactual: %#v\n", entity, itemDecoded)
 	}
 }

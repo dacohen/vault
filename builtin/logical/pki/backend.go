@@ -1,6 +1,7 @@
 package pki
 
 import (
+	"context"
 	"strings"
 	"sync"
 	"time"
@@ -10,16 +11,16 @@ import (
 )
 
 // Factory creates a new backend implementing the logical.Backend interface
-func Factory(conf *logical.BackendConfig) (logical.Backend, error) {
-	b := Backend()
-	if err := b.Setup(conf); err != nil {
+func Factory(ctx context.Context, conf *logical.BackendConfig) (logical.Backend, error) {
+	b := Backend(conf)
+	if err := b.Setup(ctx, conf); err != nil {
 		return nil, err
 	}
 	return b, nil
 }
 
 // Backend returns a new Backend framework struct
-func Backend() *backend {
+func Backend(conf *logical.BackendConfig) *backend {
 	var b backend
 	b.Backend = &framework.Backend{
 		PeriodicFunc: b.periodicFunc,
@@ -44,6 +45,10 @@ func Backend() *backend {
 			Root: []string{
 				"root",
 				"root/sign-self-issued",
+			},
+
+			SealWrapStorage: []string{
+				"config/ca_bundle",
 			},
 		},
 
@@ -82,6 +87,8 @@ func Backend() *backend {
 
 	b.crlLifetime = time.Hour * 72
 	b.periodicTidyInterval = time.Hour * 48
+	b.tidyCASGuard = new(uint32)
+	b.storage = conf.StorageView
 
 	return &b
 }
@@ -89,20 +96,21 @@ func Backend() *backend {
 type backend struct {
 	*framework.Backend
 
+	storage              logical.Storage
 	crlLifetime          time.Duration
 	periodicTidyInterval time.Duration
 	revokeStorageLock    sync.RWMutex
-	tidyRunning          int32
+	tidyCASGuard         *uint32
 	lastTidyTime         time.Time
 }
 
 // This periodicFunc will be invoked once per minute by the RollbackManager
 // This removes stale CRL entries and expired certificates
-func (b *backend) periodicFunc(req *logical.Request) error {
+func (b *backend) periodicFunc(ctx context.Context, req *logical.Request) error {
 	bufferDuration := defaultSafetyBufferDuration * time.Second
 	if time.Now().Sub(b.lastTidyTime) > b.periodicTidyInterval {
 		b.lastTidyTime = time.Now()
-		return b.tidyPKI(req, bufferDuration, true, true)
+		return b.tidyPKI(ctx, req, bufferDuration, true, true, true)
 	}
 	return nil
 }

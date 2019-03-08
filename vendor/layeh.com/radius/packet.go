@@ -8,7 +8,7 @@ import (
 	"errors"
 )
 
-// MaxPacketLength is the maximum possible wire length of a RADIUS packet.
+// MaxPacketLength is the maximum wire length of a RADIUS packet.
 const MaxPacketLength = 4095
 
 // Packet is a RADIUS packet.
@@ -21,10 +21,12 @@ type Packet struct {
 }
 
 // New creates a new packet with the Code, Secret fields set to the given
-// values. The returned packet's Identifier, Authenticator are filled with
-// random values.
+// values. The returned packet's Identifier and Authenticator fields are filled
+// with random values.
+//
+// The function panics if not enough random data could be generated.
 func New(code Code, secret []byte) *Packet {
-	buff := make([]byte, 17)
+	var buff [17]byte
 	if _, err := rand.Read(buff[:]); err != nil {
 		panic(err)
 	}
@@ -47,7 +49,7 @@ func Parse(b, secret []byte) (*Packet, error) {
 	}
 
 	length := int(binary.BigEndian.Uint16(b[2:4]))
-	if length < 20 || length > MaxPacketLength || len(b) > length {
+	if length < 20 || length > MaxPacketLength || len(b) != length {
 		return nil, errors.New("radius: invalid packet length")
 	}
 
@@ -97,7 +99,7 @@ func (p *Packet) Encode() ([]byte, error) {
 	switch p.Code {
 	case CodeAccessRequest:
 		copy(b[4:20], p.Authenticator[:])
-	case CodeAccessAccept, CodeAccessReject, CodeAccountingRequest, CodeAccountingResponse, CodeAccessChallenge, CodeDisconnectRequest, CodeCoARequest:
+	case CodeAccessAccept, CodeAccessReject, CodeAccountingRequest, CodeAccountingResponse, CodeAccessChallenge, CodeDisconnectRequest, CodeDisconnectACK, CodeDisconnectNAK, CodeCoARequest, CodeCoAACK, CodeCoANAK:
 		hash := md5.New()
 		hash.Write(b[:4])
 		switch p.Code {
